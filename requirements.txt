@@ -1,2 +1,2 @@
-mcp[cli]>=1.27.0
-pywin32>=308; sys_platform == "win32"
+mcp[cli]>=1.27.1
+pywin32>=311; sys_platform == "win32"
