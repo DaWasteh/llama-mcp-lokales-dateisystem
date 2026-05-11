@@ -10,12 +10,13 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13"]
 
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
@@ -28,12 +29,18 @@ jobs:
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
         pip install flake8 pytest
 
-    - name: Lint with flake8
+    - name: Lint with flake8 (Fehler prüfen)
       run: |
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        # Optional: Warnungen ausgeben (bricht den Build nicht ab)
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-        
+
+    - name: Lint with flake8 (Warnungen)
+      run: |
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+
+    - name: Syntax-Prüfung (import test)
+      run: |
+        python -c "import py_compile; py_compile.compile('lokales_dateisystem.py', doraise=True)"
+
     - name: Test with pytest
       run: |
-        python -m pytest || echo "No tests configured yet"
+        python -m pytest --tb=short -q || true

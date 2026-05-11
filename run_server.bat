@@ -4,8 +4,6 @@ chcp 65001 >nul
 setlocal enabledelayedexpansion
 
 REM Python soll stdin/stdout/stderr in UTF-8 nutzen
-set PYTHONUTF8=1
-set PYTHONIOENCODING=utf-8
 
 REM Ins Skript-Verzeichnis wechseln
 cd /d "%~dp0"
