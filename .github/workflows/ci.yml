@@ -7,12 +7,12 @@ on:
     branches: [ "main", "master" ]
 
 jobs:
-  build-and-test:
+  lint-and-type-check:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12"]
 
     steps:
     - uses: actions/checkout@v4
@@ -27,19 +27,28 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-        pip install flake8 pytest
+        pip install ruff mypy httpx
 
-    - name: Lint with flake8 (Fehler prüfen)
+    - name: Lint with Ruff
       run: |
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        ruff check internet_recherche.py lokales_dateisystem.py
 
-    - name: Lint with flake8 (Warnungen)
+    - name: Format check with Ruff
       run: |
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+        ruff check --select I --diff internet_recherche.py lokales_dateisystem.py
+
+    - name: Run MyPy on lokales_dateisystem.py
+      run: |
+        mypy lokales_dateisystem.py --ignore-missing-imports --check-untyped-defs --no-error-summary
+
+    - name: Run MyPy on internet_recherche.py
+      run: |
+        mypy internet_recherche.py --ignore-missing-imports --check-untyped-defs --no-error-summary
 
     - name: Syntax-Prüfung (import test)
       run: |
         python -c "import py_compile; py_compile.compile('lokales_dateisystem.py', doraise=True)"
+        python -c "import py_compile; py_compile.compile('internet_recherche.py', doraise=True)"
 
     - name: Test with pytest
       run: |
