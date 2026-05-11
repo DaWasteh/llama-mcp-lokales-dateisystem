@@ -1289,7 +1289,7 @@ def get_user_directories() -> dict:
 
             for folder_name, folder_id in folders_map.items():
                 try:
-                    path = ctypes.windll.shell32.SHGetFolderPathW(None, folder_id, None, 0)
+                    path = ctypes.windll.shell32.SHGetFolderPathW(None, folder_id, None, 0)  # type: ignore[attr-defined]
                     result[folder_name] = path
                 except Exception:
                     result[folder_name] = str(
