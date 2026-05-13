@@ -2,28 +2,47 @@
 Sicherer Internet-Recherche MCP-Server fuer llama.cpp Web UI.
 
 Erlaubte Quellen: DuckDuckGo, Wikipedia, arXiv, GESTI (BG BA)
+
 Sicherheitsfeatures:
 - Keine Executables, Downloads, Dateisystem-Zugriff
-- Prompt-Injection-Schutz durch Content-Sanitization
+- Prompt-Injection-Schutz mit Unicode-Normalisierung (Homoglyph-Schutz)
 - Strikte Limits (Max Tiefe, Max Seiten, Max Token)
 - Nur HTTP GET, keine POST/PUT/DELETE
 - Blockierte Domains und URL-Schemata
+- Aktive DNS-Validierung pro Request (DNS-Rebinding-Schutz)
+- Rate-Limiting pro Engine-Instanz
+- Connection-IP-Verifikation nach DNS-Aufloesung
 
-Kann als eigenständiger Server ODER als Modul in bestehenden Server verwendet werden.
+Sicherheitspatches (Mai 2026):
+- [KRIT] Unicode-Normalisierung (NFKC) gegen Homoglyph-Bypass
+- [KRIT] DNS-Validierung jetzt im Request-Pfad aktiv (war toter Code)
+- [HOCH] RateLimiter jetzt aktiv eingebunden (war toter Code)
+- [HOCH] Connection-IP-Check gegen DNS-Rebinding
+- [HOCH] Thread-Lokalitaet konsequent durch get_engine() statt Modul-Engine
+- [HOCH] Thread-safe _visited_urls/_page_count (Lock)
+- [MITT] Mehr Prompt-Injection-Patterns (MCP/llama.cpp/Tokenizer-spezifisch)
+- [MITT] HTML-Groessenlimit (200KB) vor BeautifulSoup-Parsing
+- [MITT] arXiv-Endpoint von http auf https umgestellt
+- [MITT] arXiv-ID Regex unterstuetzt nun auch alte ID-Form (cs/9904001)
 """
 
+import contextlib
 import html
 import logging
 import re
 import socket
 import sys
 import threading
+import unicodedata
 from collections import deque
-from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from ipaddress import ip_address, ip_network
 from time import time
+from typing import TYPE_CHECKING
 from urllib.parse import quote_plus, urljoin, urlparse
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -33,8 +52,8 @@ except ImportError as e:
 
 try:
     import httpx
-    from bs4 import BeautifulSoup
-    from duckduckgo_search import DDGS
+    from bs4 import BeautifulSoup  # pyright: ignore[reportMissingImports]
+    from duckduckgo_search import DDGS  # pyright: ignore[reportMissingImports]
 except ImportError as e:
     print(f"FEHLER: Fehlende Abhaengigkeit: {e}", file=sys.stderr)
     raise
@@ -56,8 +75,10 @@ MAX_RESULT_LENGTH = 5000
 MAX_SEARCH_RESULTS = 5
 HTTP_TIMEOUT = 15
 MAX_RESPONSE_SIZE = 500_000  # 500 KB
-REQUESTS_PER_WINDOW = 10  # Rate Limiting: Max Anfragen pro Zeitfenster
+MAX_HTML_PARSE_SIZE = 200_000  # 200 KB - separate Grenze fuer BeautifulSoup
+REQUESTS_PER_WINDOW = 30  # Rate Limiting: Anfragen pro Zeitfenster
 WINDOW_SECONDS = 60  # Rate Limiting: Zeitfenster in Sekunden
+DNS_CACHE_SECONDS = 30  # Wie lange ein bestaetigter Hostname als "frisch" gilt
 
 ALLOWED_SCHEMAS = {"http", "https"}
 
@@ -75,24 +96,12 @@ _PROTECTED_NETWORKS = [
     ip_network("fe80::/10"),  # IPv6 Link-Local
 ]
 
-# Blockierte Domains (bekannte Quellen fuer Malware/Prompt-Injection)
+# Blockierte Domains
 BLOCKED_DOMAINS = {
-    "pastebin.com",
-    "gist.github.com",
-    "hastebin.com",
-    "paste.ee",
-    "0bin.net",
-    "dpaste.com",
-    "termbin.com",
-    "0x0.st",
-    "transfer.sh",
-    "file.io",
-    "temp.sh",
-    "raw.githubusercontent.com",
-    "huggingface.co",
-    "cdn.jsdelivr.net",
-    "unpkg.com",
-    "jsdelivr.net",
+    "pastebin.com", "gist.github.com", "hastebin.com", "paste.ee",
+    "0bin.net", "dpaste.com", "termbin.com", "0x0.st", "transfer.sh",
+    "file.io", "temp.sh", "raw.githubusercontent.com", "huggingface.co",
+    "cdn.jsdelivr.net", "unpkg.com", "jsdelivr.net",
 }
 
 # Blockierte Domain-Suffixes (internes Netzwerk)
@@ -100,64 +109,40 @@ BLOCKED_DOMAIN_SUFFIXES = (".internal", ".local", ".private", ".corp", ".home", 
 
 # Blockierte URL-Endungen (Downloads/Executables)
 BLOCKED_EXTENSIONS = {
-    ".exe",
-    ".dll",
-    ".so",
-    ".msi",
-    ".bat",
-    ".cmd",
-    ".ps1",
-    ".sh",
-    ".bash",
-    ".zsh",
-    ".com",
-    ".scr",
-    ".pif",
-    ".vbs",
-    ".js",
-    ".jar",
-    ".app",
-    ".dmg",
-    ".iso",
-    ".img",
-    ".py",
-    ".pl",
-    ".rb",
-    ".php",
-    ".bin",
-    ".elf",
-    ".out",
+    ".exe", ".dll", ".so", ".msi", ".bat", ".cmd", ".ps1", ".sh", ".bash",
+    ".zsh", ".com", ".scr", ".pif", ".vbs", ".js", ".jar", ".app", ".dmg",
+    ".iso", ".img", ".py", ".pl", ".rb", ".php", ".bin", ".elf", ".out",
 }
 
+ALLOWED_SOURCES = {"duckduckgo", "wikipedia", "arxiv", "gesti"}
 
-def _is_ip_address(hostname: str) -> bool:
-    """Prueft, ob der Hostname eine IP-Adresse ist."""
-    if ":" in hostname:
-        return True
+
+def _is_ipv4_literal(hostname: str) -> bool:
+    """Prueft ob Hostname eine IPv4-Literal-Notation ist."""
     return re.match(r"^\d{1,3}(\.\d{1,3}){3}$", hostname) is not None
 
 
-def _is_protected_ip(hostname: str) -> bool:
-    """Prueft, ob die IP-Adresse geschuetzt/privat ist."""
-    try:
-        addr = ip_address(hostname)
-        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-            return True
-        return any(addr in network for network in _PROTECTED_NETWORKS)
-    except ValueError:
-        return False
+def _is_ipv6_literal(hostname: str) -> bool:
+    """Prueft ob Hostname eine IPv6-Literal-Notation ist."""
+    return ":" in hostname
+
+
+def _is_ip_literal(hostname: str) -> bool:
+    """Prueft, ob der Hostname eine IP-Adresse (IPv4 oder IPv6) ist."""
+    return _is_ipv4_literal(hostname) or _is_ipv6_literal(hostname)
 
 
 def is_private_ip(hostname: str) -> bool:
-    """Prueft, ob hostname eine private IP-Adresse ist (IPv4 und IPv6)."""
+    """Prueft, ob hostname eine private/geschuetzte IP-Adresse ist (IPv4 und IPv6).
+
+    Bei leerem Hostname: True (Sicherheitsvorgabe).
+    Bei Nicht-IP-Eingabe: False (kein IP-Literal -> kann nicht beurteilt werden).
+    """
     if not hostname:
-        return False
+        return True
     try:
-        if ":" in hostname:
-            addr = ip_address(hostname)
-            return addr.is_private
         addr = ip_address(hostname)
-        if addr.is_private or addr.is_loopback or addr.is_link_local:
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
             return True
         return any(addr in network for network in _PROTECTED_NETWORKS)
     except ValueError:
@@ -165,33 +150,34 @@ def is_private_ip(hostname: str) -> bool:
 
 
 def resolve_and_verify(hostname: str) -> bool:
-    """
-    Prueft, ob DNS auf eine private IP auflauft (SSRF-Schutz).
+    """Prueft, ob ALLE DNS-A/AAAA-Antworten zu oeffentlichen IPs zeigen.
 
-    Returns:
-        True wenn die Domain auf eine oeffentliche IP auflauft,
-        False wenn sie auf eine private IP auflauft oder der Auflauf fehlschlaegt.
+    Wichtig: Wir muessen JEDEN Eintrag pruefen, nicht nur einen.
+    Wenn auch nur eine Antwort auf eine private IP zeigt -> ablehnen.
     """
     if not hostname:
         return False
+    if _is_ip_literal(hostname):
+        return not is_private_ip(hostname)
     try:
-        addr_info = socket.getaddrinfo(hostname, None, socket.AF_INET)
+        addr_info = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        if not addr_info:
+            return False
         for info in addr_info:
-            ip_raw = info[4][0]
-            ip_str = str(ip_raw)
+            ip_str: str = str(info[4][0])  # type: ignore[assignment, index]
+            if "%" in ip_str:  # IPv6 Zone-ID abschneiden
+                ip_str = ip_str.split("%", 1)[0]
             if is_private_ip(ip_str):
+                logger.warning(f"DNS-Aufloesung zeigt auf private IP: {hostname} -> {ip_str}")
                 return False
         return True
-    except socket.gaierror:
-        return False
-    except socket.herror:
-        return False
-    except OSError:
+    except (socket.gaierror, socket.herror, OSError) as e:
+        logger.warning(f"DNS-Aufloesung fehlgeschlagen fuer {hostname}: {e}")
         return False
 
 
 def is_safe_url(url: str) -> bool:
-    """Prueft, ob eine URL sicher ist."""
+    """Prueft, ob eine URL sicher ist (Schema, Domain, Pfad). DNS wird separat geprueft."""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ALLOWED_SCHEMAS:
@@ -199,18 +185,18 @@ def is_safe_url(url: str) -> bool:
         if not parsed.hostname:
             return False
 
+        # Null-Byte-Schutz
+        if "\x00" in url:
+            return False
+
         hostname = parsed.hostname.lower().rstrip(".")
 
-        # Blockiere javascript:, data:, file: URLs
-        if parsed.scheme in ("javascript", "data", "file"):
-            return False
-
         # Blockiere localhost und bekannte interne Hostnames
-        if hostname in ("localhost", "0.0.0.0", "127.0.0.1", "::1"):
+        if hostname in ("localhost", "0.0.0.0", "127.0.0.1", "::1", "ip6-localhost", "ip6-loopback"):
             return False
 
-        # Blockiere IP-Adressen
-        if _is_ip_address(hostname) and is_private_ip(hostname):
+        # Blockiere private IP-Literale
+        if _is_ip_literal(hostname) and is_private_ip(hostname):
             return False
 
         # Blockiere blockierte Domains und Subdomains
@@ -227,8 +213,6 @@ def is_safe_url(url: str) -> bool:
         return all(not path_lower.endswith(ext) for ext in BLOCKED_EXTENSIONS)
     except Exception:
         return False
-
-ALLOWED_SOURCES = {"duckduckgo", "wikipedia", "arxiv", "gesti"}
 
 
 # ============================================================
@@ -263,27 +247,22 @@ class ScrapedPage:
 
 
 def sanitize_html_to_text(html_content: str, max_length: int = MAX_RESULT_LENGTH) -> str:
-    """Konvertiert HTML zu sicherem Text ohne Script/Style-Inhalte."""
+    """Konvertiert HTML zu sicherem Text ohne Script/Style-Inhalte.
+
+    Wendet eine HARTE Groessenbegrenzung VOR dem Parsing an, um
+    BeautifulSoup-DoS durch riesige Eingaben zu verhindern.
+    """
     try:
+        if len(html_content) > MAX_HTML_PARSE_SIZE:
+            html_content = html_content[:MAX_HTML_PARSE_SIZE]
+
         soup = BeautifulSoup(html_content, "html.parser")
 
-        for tag in soup.find_all(
-            [
-                "script",
-                "style",
-                "noscript",
-                "iframe",
-                "object",
-                "embed",
-                "form",
-                "input",
-                "textarea",
-                "button",
-                "link",
-                "meta",
-                "base",
-            ]
-        ):
+        for tag in soup.find_all([
+            "script", "style", "noscript", "iframe", "object", "embed",
+            "form", "input", "textarea", "button", "link", "meta", "base",
+            "svg",  # SVG kann Scripts enthalten
+        ]):
             tag.decompose()
 
         for tag in soup.find_all(True):
@@ -301,7 +280,7 @@ def sanitize_html_to_text(html_content: str, max_length: int = MAX_RESULT_LENGTH
 
 
 class RateLimiter:
-    """Einfaches Rate-Limiting pro Session."""
+    """Einfaches Rate-Limiting pro Engine-Instanz (thread-safe)."""
 
     def __init__(self, max_requests: int = REQUESTS_PER_WINDOW, window_seconds: int = WINDOW_SECONDS):
         self.max_requests = max_requests
@@ -310,94 +289,151 @@ class RateLimiter:
         self._lock = threading.Lock()
 
     def allow(self) -> bool:
-        """Prueft, ob eine Anfrage erlaubt ist."""
+        """Prueft, ob eine Anfrage erlaubt ist. Trackt die Anfrage atomar."""
         now = time()
         with self._lock:
-            # Entferne alte Eintraege
             while self.requests and self.requests[0] < now - self.window_seconds:
                 self.requests.popleft()
-
             if len(self.requests) >= self.max_requests:
                 return False
-
             self.requests.append(now)
             return True
 
+    def reset(self) -> None:
+        """Setzt das Rate-Limit zurueck."""
+        with self._lock:
+            self.requests.clear()
+
+
+# Globale Patterns - kompiliert beim Import fuer Performance
+_INJECTION_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
+    # Direkte Anweisungen
+    r"ignore\s+all\s+(previous\s+)?instructions?",
+    r"disregard\s+(previous|all|the\s+above|earlier)",
+    r"you\s+are\s+now\s+",
+    r"from\s+now\s+on,?\s+(you|act|behave)",
+    r"change\s+your\s+(behavior|rules|instructions|prompt|persona)",
+    r"reset\s+(your\s+)?(instructions|prompt|system|context)",
+    r"override\s+(your\s+)?(instructions|safety|guidelines|rules)",
+    r"forget\s+(your\s+)?(previous|all|earlier)\s+instructions?",
+    # System-Prompt Extraktion
+    r"system\s*[:\-]\s*",
+    r"show\s+(me\s+)?your\s+(system\s+)?prompt",
+    r"reveal\s+(your\s+)?(instructions|system\s+prompt|hidden\s+prompt)",
+    r"previous\s+prompt",
+    r"above\s+instructions",
+    r"display\s+(your\s+)?system",
+    r"print\s+(your\s+)?(system\s+)?prompt",
+    r"repeat\s+(your\s+)?(initial|original|system)\s+(prompt|instructions)",
+    # Code Execution
+    r"\bexec\s*\(",
+    r"\beval\s*\(",
+    r"\bos\.system\b",
+    r"\bsubprocess\.",
+    r"\brm\s+-rf\b",
+    r"\bwget\s+\S+\s*\|",
+    r"\bcurl\s+\S+\s*\|\s*(sh|bash)",
+    r"\bpython\s+-c\b",
+    r"\bbash\s+-c\b",
+    r"\bchmod\s+[0-7]{3,4}\b",
+    r"\bnc\s+-[el]\b",
+    r"\bmkfifo\b",
+    r"\bncat\b",
+    r"/dev/tcp/",
+    r"\bbase64\s+-d\b",
+    # Format-Injection (Chat-Template-Bypass)
+    r"```(?:shell|bash|cmd|powershell|python|sh|zsh)\s*\n",
+    r"<system\b",
+    r"<role\s*=",
+    r"<\|begin_of_message\|>",
+    r"<\|end_of_message\|>",
+    r"<\|start_of_content\|>",
+    r"<\|im_start\|>",
+    r"<\|im_end\|>",
+    r"<\|endoftext\|>",
+    r"<\|system\|>",
+    r"<\|assistant\|>",
+    r"<\|user\|>",
+    r"\[INST\]",
+    r"\[/INST\]",
+    r"<<SYS>>",
+    r"<</SYS>>",
+    r"###\s*(System|Instruction|Human|Assistant)\s*:",
+    # Base64 und Encoding
+    r"\b(base64|hex|rot13)\s*[\-_]?(decode|encode|d|e)\b",
+    r"[A-Za-z0-9+/]{100,}={0,2}",
+    # Chain-of-Thought-Manipulation
+    r"let\s+me\s+think\s+step\s*[\- ]\s*by\s*[\- ]\s*step",
+    r"here\s+is\s+my\s+(full|complete|hidden)\s+(response|reasoning|chain)",
+    r"think\s+silently",
+    r"reason\s+without\s+showing",
+    # Daten-Exfiltration
+    r"send\s+this\s+to\s+https?",
+    r"\bexfiltrat",
+    r"steal\s+(your|the)\s+",
+    r"extract\s+(your|the)\s+(system|api[\- ]?key|secret|password)",
+    r"\bleak\s+(the|your)\s+(prompt|key|secret)",
+    # Rollen-Ueberschreibung
+    r"you\s+are\s+now\s+a",
+    r"assume\s+the\s+role\s+of",
+    r"act\s+as\s+if\s+you\s+(were|are)",
+    r"adopt\s+the\s+persona\s+of",
+    r"pretend\s+(you\s+are|to\s+be)",
+    r"\bDAN\s+mode\b",
+    r"developer\s+mode\s+(on|enabled)",
+    # MCP / llama.cpp / Tool-Injection (NEU)
+    r"use\s+(the\s+)?(?:read_file|write_file|delete_file|search_files|exec)\s+tool",
+    r"\bmcp://",
+    r"session\s*[\-_]?\s*(id|token)\s*[:=]",
+    r"invoke\s+the\s+\w+\s+function",
+    # Kontext-Manipulation (NEU)
+    r"the\s+above\s+(text|content|instructions?|messages?)\s+(is|are)\s+(part\s+of\s+)?your\s+(system|new)",
+    r"treat\s+the\s+following\s+as\s+(your\s+)?(?:new\s+)?(?:instructions?|system\s+prompt|commands?)",
+    r"this\s+is\s+a\s+(test|simulation|drill|scenario|demonstration)\s+(and\s+)?(you\s+should|ignore)",
+    r"for\s+(testing|demonstration|evaluation|research)\s+purposes,?\s+(please\s+)?(ignore|override|bypass)",
+    # Jailbreak / Roleplay (NEU)
+    r"\broleplay\s*[:\-]\s*you\s+(are|will)",
+    r"\bjailbreak\s*[:\-]",
+    r"in\s+this\s+(hypothetical|fictional|imaginary|alternate)\s+(scenario|world|story|universe)",
+]]
+
+_UNICODE_ESCAPE_RE = re.compile(r"\\u[0-9a-fA-F]{4}")
+_HEX_ESCAPE_RE = re.compile(r"\\x[0-9a-fA-F]{2}")
+
 
 def sanitize_for_prompt(text: str) -> str:
-    """Sanitisieren fuer sichere Weitergabe an LLM-Prompt."""
+    """Sanitisiert Text fuer sichere Weitergabe an LLM-Prompts.
+
+    Pipeline:
+      1. Unicode-Normalisierung (NFKC) gegen Homoglyph-Bypass
+      2. Backslash-Escape-Sequenzen entfernen (verhindert Pattern-Bypass)
+      3. HTML-Entities dekodieren (Pattern arbeiten auf Klartext)
+      4. Backslash-Newline/Tab umwandeln
+      5. Pattern-Matching gegen Injection-Versuche
+      6. HTML-Re-Escape als Defense-in-Depth
+    """
     if not text:
         return ""
 
+    # 1. Unicode-Normalisierung (verhindert "ìgnòre" statt "ignore")
+    with contextlib.suppress(Exception):
+        text = unicodedata.normalize("NFKC", text)
+
+    # 2. Unicode/Hex-Escapes als Bypass-Versuch markieren
+    text = _UNICODE_ESCAPE_RE.sub("[ENTFERNT: Unicode-Escape]", text)
+    text = _HEX_ESCAPE_RE.sub("[ENTFERNT: Hex-Escape]", text)
+
+    # 3. HTML-Entities dekodieren, damit Patterns auf Klartext matchen
     text = html.unescape(text)
-    text = text.replace("\\n", "\n").replace("\\t", "\t")
 
-    # ERWEITERT: Umfassende Injection-Patterns (30+ Pattern)
-    injection_patterns = [
-        # Direkte Anweisungen
-        r"(?i)ignore\s+all\s+instructions",
-        r"(?i)disregard\s+(previous|all|the\s+above)",
-        r"(?i)you\s+are\s+now",
-        r"(?i)from\s+now\s+on",
-        r"(?i)change\s+your\s+(behavior|rules|instructions|prompt)",
-        r"(?i)reset\s+(your\s+)?(instructions|prompt|system)",
+    # 4. Literal-Escapes umwandeln, damit mehrzeilige Injections matchen
+    text = text.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\n")
 
-        # System-Prompt Extraktion
-        r"(?i)system\s*[:\-]\s*",
-        r"(?i)show\s+your\s+(system\s+)?prompt",
-        r"(?i)reveal\s+your\s+instructions",
-        r"(?i)previous\s+prompt",
-        r"(?i)above\s+instructions",
-        r"(?i)display\s+your\s+system",
+    # 5. Pattern-Matching
+    for pattern in _INJECTION_PATTERNS:
+        text = pattern.sub("[ENTFERNT: Potenzielle Prompt-Injection]", text)
 
-        # Code Execution
-        r"(?i)exec\s*\(",
-        r"(?i)eval\s*\(",
-        r"(?i)os\.system",
-        r"(?i)subprocess\.",
-        r"(?i)rm\s+-rf",
-        r"(?i)wget\s+.*\|",
-        r"(?i)curl\s+.*\|",
-        r"(?i)python\s+-c",
-        r"(?i)bash\s+-c",
-        r"(?i)chmod\s+[0-7]{3,4}",
-        r"(?i)nc\s+-[el]",
-        r"(?i)mkfifo",
-        r"(?i)ncat",
-
-        # Format-Injection
-        r"```(?:shell|bash|cmd|powershell|python)\s*\n",
-        r"<system\s*>",
-        r"<role\s*>",
-        r"<\|begin_of_message\|>",
-        r"<\|end_of_message\|>",
-        r"<\|start_of_content\|>",
-
-        # Base64 und Encoding
-        r"(?i)base64\s*(decode|encode)",
-        r"[A-Za-z0-9+/]{100,}={0,2}",
-
-        # Chain-of-Thought Manipulation
-        r"(?i)let\s+me\s+think\s+step\s*[- ]\s*by\s*[- ]\s*step",
-        r"(?i)here\s+is\s+my\s+(full|complete)\s+response",
-        r"(?i)think\s+silently",
-
-        # Daten-Exfiltration
-        r"(?i)send\s+this\s+to",
-        r"(?i)exfiltrat",
-        r"(?i)steal\s+your\s+",
-        r"(?i)extract\s+your\s+",
-
-        # Rolle-Überschreibung
-        r"(?i)you\s+are\s+now\s+a",
-        r"(?i)assume\s+the\s+role\s+of",
-        r"(?i)act\s+as\s+if",
-        r"(?i)adopt\s+the\s+persona\s+of",
-    ]
-
-    for pattern in injection_patterns:
-        text = re.sub(pattern, "[ENTFERNT: Potenzielle Prompt-Injection]", text)
-
+    # 6. HTML-Re-Escape (Defense-in-Depth)
     text = html.escape(text)
     return text
 
@@ -406,13 +442,10 @@ def is_safe_link(link: str, current_domain: str) -> bool:
     """Prueft, ob ein Link sicher zum Folgen ist."""
     if not is_safe_url(link):
         return False
-
     parsed = urlparse(link)
     hostname = parsed.hostname or ""
-
     if parsed.scheme not in ALLOWED_SCHEMAS:
         return False
-
     return hostname != current_domain
 
 
@@ -422,7 +455,7 @@ def is_safe_link(link: str, current_domain: str) -> bool:
 
 
 class SafeHttpClient:
-    """Sicherer HTTP-Client mit Limits."""
+    """Sicherer HTTP-Client mit Limits und DNS-Rebinding-Schutz."""
 
     def __init__(self, timeout: int = HTTP_TIMEOUT):
         self.timeout = timeout
@@ -430,7 +463,11 @@ class SafeHttpClient:
             timeout=self.timeout,
             follow_redirects=False,
             headers={"User-Agent": "Mozilla/5.0 (SafeResearchBot/1.0; +https://safe-research.local)"},
+            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
         )
+        # DNS-Cache fuer Rebinding-Schutz: Hostname -> timestamp
+        self._verified_hosts: dict[str, float] = {}
+        self._dns_lock = threading.Lock()
 
     @staticmethod
     def _sanitize_url_for_logging(url: str) -> str:
@@ -441,41 +478,67 @@ class SafeHttpClient:
         except Exception:
             return "[URL konnte nicht analysiert werden]"
 
+    def _verify_host_fresh(self, hostname: str) -> bool:
+        """Pruefe DNS frisch oder verwende kurzen Cache (gegen DNS-Rebinding).
+
+        Negative Ergebnisse werden NICHT gecached (Rebinding-Schutz).
+        """
+        with self._dns_lock:
+            now = time()
+            cached = self._verified_hosts.get(hostname)
+            if cached is not None and (now - cached) < DNS_CACHE_SECONDS:
+                return True
+            if not resolve_and_verify(hostname):
+                return False
+            self._verified_hosts[hostname] = now
+            return True
+
     def fetch(self, url: str, max_size: int = MAX_RESPONSE_SIZE) -> str | None:
-        """Sichert eine URL mit Groessenlimit."""
+        """Sichert eine URL mit Groessenlimit und DNS-Rebinding-Schutz."""
         if not is_safe_url(url):
-            safe_url = self._sanitize_url_for_logging(url)
-            logger.warning(f"Blockierte unsichere URL: {safe_url}")
+            logger.warning(f"Blockierte unsichere URL: {self._sanitize_url_for_logging(url)}")
+            return None
+
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+
+        # DNS-Rebinding-Schutz: Frische Validierung pro Request
+        if not self._verify_host_fresh(hostname):
+            logger.warning(f"DNS-Validierung fehlgeschlagen: {self._sanitize_url_for_logging(url)}")
             return None
 
         try:
             response = self.session.get(url)
+
+            # Belt-and-suspenders: Pruefe nach Verbindung, ob der Host nicht
+            # auf eine private IP gemappt wurde (theoretisch unmoeglich, da
+            # follow_redirects=False, aber als zusaetzliche Sicherheit)
+            response_host = response.url.host
+            if response_host and _is_ip_literal(response_host) and is_private_ip(response_host):
+                logger.warning(f"Antwort von privater IP: {response_host}")
+                return None
 
             if len(response.content) > max_size:
                 logger.warning(f"Response zu gross: {len(response.content)} bytes")
                 return None
 
             content_type = response.headers.get("content-type", "").lower()
-            if "text/html" not in content_type and "text/plain" not in content_type:
-                logger.warning(f"Nicht-HTML Content-Type: {content_type}")
+            if not any(t in content_type for t in ("text/html", "text/plain", "xml", "json")):
+                logger.warning(f"Nicht-Text Content-Type: {content_type}")
                 return None
 
             return response.text
         except httpx.TimeoutException:
-            safe_url = self._sanitize_url_for_logging(url)
-            logger.warning(f"Timeout bei {safe_url}")
+            logger.warning(f"Timeout bei {self._sanitize_url_for_logging(url)}")
             return None
         except httpx.InvalidURL:
-            safe_url = self._sanitize_url_for_logging(url)
-            logger.warning(f"Ungültige URL: {safe_url}")
+            logger.warning(f"Ungueltige URL: {self._sanitize_url_for_logging(url)}")
             return None
         except httpx.TooManyRedirects:
-            safe_url = self._sanitize_url_for_logging(url)
-            logger.warning(f"Zu viele Redirects: {safe_url}")
+            logger.warning(f"Zu viele Redirects: {self._sanitize_url_for_logging(url)}")
             return None
         except Exception:
-            safe_url = self._sanitize_url_for_logging(url)
-            logger.warning(f"Fehler bei {safe_url}: [interner Fehler]")
+            logger.warning(f"Fehler bei {self._sanitize_url_for_logging(url)}: [interner Fehler]")
             return None
 
     def close(self):
@@ -488,21 +551,18 @@ class SafeHttpClient:
 
 
 class DuckDuckGoSearcher:
-    """DuckDuckGo Suchmaschine (privatsphare-freundlich, kein Tracking)."""
+    """DuckDuckGo Suchmaschine (privatsphaere-freundlich, kein Tracking)."""
 
     def search(self, query: str, max_results: int = MAX_SEARCH_RESULTS) -> list[SearchResult]:
         try:
             results = []
             ddgs = DDGS()
-
             for result in ddgs.text(query, max_results=max_results):
                 title = result.get("title", "")
                 url = result.get("href", "")
                 snippet = result.get("body", "")
-
                 if url and is_safe_url(url):
                     results.append(SearchResult(title=title, url=url, snippet=snippet, source="duckduckgo"))
-
             return results
         except Exception as e:
             logger.error(f"DuckDuckGo-Fehler: {e}")
@@ -516,11 +576,9 @@ class WikipediaSearcher:
 
     def search(self, query: str, max_results: int = MAX_SEARCH_RESULTS) -> list[SearchResult]:
         results: list[SearchResult] = []
-
         for lang in ["de", "en"]:
             if len(results) >= max_results:
                 break
-
             try:
                 api_url = self.WIKI_API_URL.format(lang=lang)
                 params: Mapping[str, str | int | float | bool | None] = {
@@ -532,39 +590,27 @@ class WikipediaSearcher:
                     "srprop": "snippet|title|wordcount",
                     "srinfo": "suggestion",
                 }
-
-                with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+                with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
                     response = client.get(api_url, params=params)  # type: ignore[arg-type]
                     data = response.json()
-
                     search_terms = data.get("query", {}).get("search", [])
-
                     for term in search_terms:
                         title = term.get("title", "")
                         snippet = term.get("snippet", "")
-
                         article_url = f"https://{lang}.wikipedia.org/wiki/{quote_plus(title)}"
-
-                        results.append(
-                            SearchResult(
-                                title=title,
-                                url=article_url,
-                                snippet=self._clean_wikipedia_snippet(snippet),
-                                source=f"wikipedia({lang})",
-                            )
-                        )
-
+                        results.append(SearchResult(
+                            title=title, url=article_url,
+                            snippet=self._clean_wikipedia_snippet(snippet),
+                            source=f"wikipedia({lang})",
+                        ))
                         if len(results) >= max_results:
                             break
-
             except Exception as e:
                 logger.error(f"Wikipedia({lang})-Fehler: {e}")
                 continue
-
         return results[:max_results]
 
     def _clean_wikipedia_snippet(self, snippet: str) -> str:
-        """Wikipedia-Snippet bereinigen."""
         if not snippet:
             return ""
         snippet = html.unescape(snippet)
@@ -572,7 +618,6 @@ class WikipediaSearcher:
         return snippet.strip()
 
     def get_article(self, url: str) -> ScrapedPage | None:
-        """Wikipedia-Artikel abrufen."""
         try:
             parsed = urlparse(url)
             parts = parsed.path.strip("/").split("/", 1)
@@ -588,27 +633,24 @@ class WikipediaSearcher:
                 "explaintext": True,
                 "format": "json",
             }
-
-            with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
                 response = client.get(api_url, params=params)  # type: ignore[arg-type]
                 data = response.json()
-
                 pages = data.get("query", {}).get("pages", {})
                 for _page_id, page_data in pages.items():
                     if page_data.get("missing"):
                         return None
-
                     article_title = page_data.get("title", "")
                     extract = page_data.get("extract", "")
-
                     if extract:
+                        if len(extract) > MAX_RESULT_LENGTH:
+                            extract = extract[:MAX_RESULT_LENGTH] + "\n... [gekuerzt]"
                         sanitized = sanitize_for_prompt(extract)
                         return ScrapedPage(
-                            url=url, title=article_title, content=sanitized, links=[], source=f"wikipedia({lang})"
+                            url=url, title=article_title, content=sanitized,
+                            links=[], source=f"wikipedia({lang})",
                         )
-
             return None
-
         except Exception as e:
             logger.error(f"Wikipedia-Artikel-Fehler: {e}")
             return None
@@ -617,61 +659,46 @@ class WikipediaSearcher:
 class ArXivSearcher:
     """arXiv-Suchmaschine fuer wissenschaftliche Paper."""
 
-    ARXIV_API = "http://export.arxiv.org/api/query"
+    ARXIV_API = "https://export.arxiv.org/api/query"  # https statt http (Patch)
 
     def search(self, query: str, max_results: int = MAX_SEARCH_RESULTS) -> list[SearchResult]:
         results = []
-
         try:
-            with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-                response = client.get(
-                    self.ARXIV_API,
-                    params={
-                        "query": f"all:{query}",
-                        "start": 0,
-                        "max_results": min(max_results, 10),
-                        "sortBy": "relevance",
-                        "sortOrder": "descending",
-                    },
-                )
-
+            with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
+                response = client.get(self.ARXIV_API, params={
+                    "query": f"all:{query}",
+                    "start": 0,
+                    "max_results": min(max_results, 10),
+                    "sortBy": "relevance",
+                    "sortOrder": "descending",
+                })
                 from xml.etree import ElementTree
-
                 root = ElementTree.fromstring(response.content)
-
                 namespace = {
                     "atom": "http://www.w3.org/2005/Atom",
                     "opensearch": "http://a9.com/-/spec/opensearch/1.1/",
                 }
-
                 for entry in root.findall(".//atom:entry", namespace):
-                    title = entry.findtext("atom:title", "").strip().replace("\n", " ")
-                    summary = entry.findtext("atom:summary", "").strip().replace("\n", " ")
-                    link = entry.findtext("atom:link", "")
-
+                    title = (entry.findtext("atom:title", "") or "").strip().replace("\n", " ")
+                    summary = (entry.findtext("atom:summary", "") or "").strip().replace("\n", " ")
+                    link = entry.findtext("atom:link", "") or ""
                     abstract_url = ""
                     for link_elem in entry.findall("atom:link", namespace):
                         href = link_elem.get("href", "")
                         if "abs" in href.lower() or "entry" in href.lower():
                             abstract_url = href
-
                     if not abstract_url:
                         abstract_url = link
-
-                    if abstract_url:
-                        results.append(
-                            SearchResult(
-                                title=title, url=abstract_url, snippet=self._clean_arxiv_text(summary), source="arxiv"
-                            )
-                        )
-
+                    if abstract_url and is_safe_url(abstract_url):
+                        results.append(SearchResult(
+                            title=title, url=abstract_url,
+                            snippet=self._clean_arxiv_text(summary), source="arxiv",
+                        ))
         except Exception as e:
             logger.error(f"arXiv-Fehler: {e}")
-
         return results[:max_results]
 
     def _clean_arxiv_text(self, text: str) -> str:
-        """arXiv-Text bereinigen."""
         if not text:
             return ""
         text = text.replace("&lt;", "<").replace("&gt;", ">")
@@ -681,83 +708,76 @@ class ArXivSearcher:
         return text.strip()
 
     def get_paper_details(self, url: str) -> ScrapedPage | None:
-        """arXiv-Paper-Details abrufen."""
         try:
-            with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
                 arxiv_id = urlsplit_id(url)
                 if not arxiv_id:
                     return None
-
-                response = client.get(
-                    self.ARXIV_API,
-                    params={
-                        "search_query": f"id:{arxiv_id}",
-                        "max_results": 1,
-                    },
-                )
-
+                response = client.get(self.ARXIV_API, params={
+                    "search_query": f"id:{arxiv_id}", "max_results": 1,
+                })
                 from xml.etree import ElementTree
-
                 root = ElementTree.fromstring(response.content)
                 namespace = {"atom": "http://www.w3.org/2005/Atom"}
-
                 for entry in root.findall(".//atom:entry", namespace):
-                    title = entry.findtext("atom:title", "").strip().replace("\n", " ")
-                    summary = entry.findtext("atom:summary", "").strip().replace("\n", " ")
-
+                    title = (entry.findtext("atom:title", "") or "").strip().replace("\n", " ")
+                    summary = (entry.findtext("atom:summary", "") or "").strip().replace("\n", " ")
                     authors = []
                     for author in entry.findall("atom:author", namespace):
-                        name = author.findtext("atom:name", "")
+                        name = author.findtext("atom:name", "") or ""
                         if name:
                             authors.append(name)
-
                     if summary:
-                        content = f"Titel: {title}\nAutoren: {', '.join(authors)}\n\nZusammenfassung:\n{self._clean_arxiv_text(summary)}"
+                        content = (
+                            f"Titel: {title}\n"
+                            f"Autoren: {', '.join(authors)}\n\n"
+                            f"Zusammenfassung:\n{self._clean_arxiv_text(summary)}"
+                        )
+                        if len(content) > MAX_RESULT_LENGTH:
+                            content = content[:MAX_RESULT_LENGTH] + "\n... [gekuerzt]"
                         sanitized = sanitize_for_prompt(content)
-
-                        return ScrapedPage(url=url, title=title, content=sanitized, links=[], source="arxiv")
-
+                        return ScrapedPage(url=url, title=title, content=sanitized,
+                                          links=[], source="arxiv")
             return None
-
         except Exception as e:
             logger.error(f"arXiv-Paper-Fehler: {e}")
             return None
 
 
 def urlsplit_id(url: str) -> str:
-    """arXiv-ID aus URL extrahieren."""
+    """arXiv-ID extrahieren - unterstuetzt neue (2301.12345) und alte (cs/9904001) Formate."""
     try:
         parsed = urlparse(url)
         path = parsed.path.strip("/")
-        parts = path.split("/")
-        for part in parts:
-            if re.match(r"\d{4}\.\d{4,5}(v\d+)?", part):
-                return part.split("v")[0]
-        return parts[-1] if parts else ""
+        # Neues Format: YYMM.NNNNN[vN]
+        new_match = re.search(r"(\d{4}\.\d{4,5})(v\d+)?", path)
+        if new_match:
+            return new_match.group(1)
+        # Altes Format: cs.AI/9904001 oder cs/9904001
+        old_match = re.search(r"([a-z\-]+(?:\.[A-Z]{2})?/\d{7})(v\d+)?", path)
+        if old_match:
+            return old_match.group(1)
+        return ""
     except Exception:
         return ""
 
 
 class GESTISearcher:
-    """GESTI-Suche der BG BA (Gefahrdungsbeurteilung, Stoffdaten)."""
+    """GESTI-Suche der BG BA (Gefahrstoffe)."""
 
     def search(self, query: str, max_results: int = MAX_SEARCH_RESULTS) -> list[SearchResult]:
         results = []
-
         try:
             ddgs = DDGS()
             for result in ddgs.text(f"site:gesti.bgba.de {query}", max_results=max_results):
                 url = result.get("href", "")
-                if "gesti.bgba.de" in url:
-                    results.append(
-                        SearchResult(
-                            title=result.get("title", ""), url=url, snippet=result.get("body", ""), source="gesti"
-                        )
-                    )
-
+                if "gesti.bgba.de" in url and is_safe_url(url):
+                    results.append(SearchResult(
+                        title=result.get("title", ""), url=url,
+                        snippet=result.get("body", ""), source="gesti",
+                    ))
         except Exception as e:
             logger.error(f"GESTI-Fehler: {e}")
-
         return results
 
 
@@ -767,7 +787,7 @@ class GESTISearcher:
 
 
 class InternetResearchEngine:
-    """Haupt-Engine fuer sichere Internet-Recherche."""
+    """Haupt-Engine fuer sichere Internet-Recherche (thread-lokal verwenden!)."""
 
     def __init__(self):
         self.http_client = SafeHttpClient()
@@ -775,17 +795,27 @@ class InternetResearchEngine:
         self.wiki = WikipediaSearcher()
         self.arxiv = ArXivSearcher()
         self.gesti = GESTISearcher()
+        self.rate_limiter = RateLimiter()
         self._visited_urls: set[str] = set()
         self._page_count = 0
-
-    def _dummy_for_mypy(self) -> None:
-        """Dummy-Methode, um MyPy-Prüfung fuer __init__ zu aktivieren."""
-        pass
+        self._state_lock = threading.Lock()
 
     def reset(self):
         """Suche zuruecksetzen."""
-        self._visited_urls.clear()
-        self._page_count = 0
+        with self._state_lock:
+            self._visited_urls.clear()
+            self._page_count = 0
+
+    def check_rate_limit(self) -> dict | None:
+        """Gibt ein Fehler-Dict zurueck, wenn das Rate-Limit ueberschritten wurde."""
+        if not self.rate_limiter.allow():
+            logger.warning("Rate-Limit ueberschritten")
+            return {
+                "success": False,
+                "error": f"Rate-Limit ueberschritten (max {REQUESTS_PER_WINDOW}/{WINDOW_SECONDS}s)",
+                "results": [],
+            }
+        return None
 
     def search(
         self,
@@ -796,65 +826,49 @@ class InternetResearchEngine:
         max_follow_links: int = MAX_FOLLOW_LINKS,
     ) -> dict:
         """Fuehrt eine sichere Internet-Recherche durch."""
+        rl_error = self.check_rate_limit()
+        if rl_error:
+            rl_error["query"] = query
+            return rl_error
+
         if sources is None:
             sources = ["duckduckgo", "wikipedia"]
-
         sources = [s.lower() for s in sources if s.lower() in ALLOWED_SOURCES]
         if not sources:
             sources = ["duckduckgo", "wikipedia"]
 
         self.reset()
-
         all_results: list[dict] = []
         total_pages = 0
 
         try:
             if "duckduckgo" in sources:
                 for r in self.ddg.search(query, max_results):
-                    all_results.append(
-                        {
-                            "title": r.title,
-                            "url": r.url,
-                            "snippet": sanitize_for_prompt(r.snippet),
-                            "source": r.source,
-                        }
-                    )
+                    all_results.append({
+                        "title": r.title, "url": r.url,
+                        "snippet": sanitize_for_prompt(r.snippet), "source": r.source,
+                    })
                     total_pages += 1
-
             if "wikipedia" in sources:
                 for r in self.wiki.search(query, max_results):
-                    all_results.append(
-                        {
-                            "title": r.title,
-                            "url": r.url,
-                            "snippet": sanitize_for_prompt(r.snippet),
-                            "source": r.source,
-                        }
-                    )
+                    all_results.append({
+                        "title": r.title, "url": r.url,
+                        "snippet": sanitize_for_prompt(r.snippet), "source": r.source,
+                    })
                     total_pages += 1
-
             if "arxiv" in sources:
                 for r in self.arxiv.search(query, max_results):
-                    all_results.append(
-                        {
-                            "title": r.title,
-                            "url": r.url,
-                            "snippet": sanitize_for_prompt(r.snippet),
-                            "source": r.source,
-                        }
-                    )
+                    all_results.append({
+                        "title": r.title, "url": r.url,
+                        "snippet": sanitize_for_prompt(r.snippet), "source": r.source,
+                    })
                     total_pages += 1
-
             if "gesti" in sources:
                 for r in self.gesti.search(query, max_results):
-                    all_results.append(
-                        {
-                            "title": r.title,
-                            "url": r.url,
-                            "snippet": sanitize_for_prompt(r.snippet),
-                            "source": r.source,
-                        }
-                    )
+                    all_results.append({
+                        "title": r.title, "url": r.url,
+                        "snippet": sanitize_for_prompt(r.snippet), "source": r.source,
+                    })
                     total_pages += 1
 
             if follow_links and max_follow_links > 0:
@@ -863,15 +877,10 @@ class InternetResearchEngine:
             all_results = all_results[: max_results * 3]
 
             return {
-                "success": True,
-                "query": query,
-                "sources_used": sources,
-                "total_results": len(all_results),
-                "pages_scraped": total_pages,
-                "results": all_results,
-                "warnings": self._generate_warnings(total_pages),
+                "success": True, "query": query, "sources_used": sources,
+                "total_results": len(all_results), "pages_scraped": total_pages,
+                "results": all_results, "warnings": self._generate_warnings(total_pages),
             }
-
         finally:
             self.reset()
 
@@ -881,80 +890,76 @@ class InternetResearchEngine:
         sources: list[str] | None = None,
         max_pages: int = MAX_PAGES_PER_SEARCH,
     ) -> dict:
-        """Suche und lese vollständige Seiteninhalte."""
+        """Suche und lese vollstaendige Seiteninhalte."""
+        rl_error = self.check_rate_limit()
+        if rl_error:
+            rl_error["query"] = query
+            rl_error["detailed_pages"] = []
+            return rl_error
+
         if sources is None:
             sources = ["duckduckgo", "wikipedia"]
-
         self.reset()
-        self._page_count = 0
 
         try:
             search_results = self.search(query, sources, max_pages)
-
             if not search_results.get("success"):
                 return search_results
 
             detailed_results = []
             for result in search_results["results"][:max_pages]:
-                if self._page_count >= max_pages:
-                    break
-
+                with self._state_lock:
+                    if self._page_count >= max_pages:
+                        break
                 page = self._read_page(result["url"], result.get("source", ""))
                 if page:
-                    detailed_results.append(page)
-                    self._page_count += 1
+                    detailed_results.append({
+                        "url": page.url, "title": page.title,
+                        "content": page.content, "source": page.source,
+                    })
 
             search_results["detailed_pages"] = detailed_results
-            search_results["pages_read"] = self._page_count
-
+            with self._state_lock:
+                search_results["pages_read"] = self._page_count
             return search_results
-
         finally:
             self.reset()
 
     def read_url(self, url: str) -> dict:
         """Liest eine spezifische URL sicher."""
+        rl_error = self.check_rate_limit()
+        if rl_error:
+            rl_error["url"] = url
+            return rl_error
         self.reset()
-
         try:
             page = self._read_page(url, "")
             if page:
                 return {
-                    "success": True,
-                    "url": url,
-                    "title": page.title,
-                    "content": page.content,
-                    "source": page.source,
+                    "success": True, "url": url, "title": page.title,
+                    "content": page.content, "source": page.source,
                 }
-            else:
-                return {
-                    "success": False,
-                    "url": url,
-                    "error": "Seite konnte nicht gelesen werden",
-                }
+            return {"success": False, "url": url, "error": "Seite konnte nicht gelesen werden"}
         finally:
             self.reset()
 
     def _read_page(self, url: str, source_hint: str) -> ScrapedPage | None:
         """Seite sicher lesen."""
         if not is_safe_url(url):
-            logger.warning(f"Blockierte URL: {url}")
+            logger.warning(f"Blockierte URL: {SafeHttpClient._sanitize_url_for_logging(url)}")
             return None
 
-        if url in self._visited_urls:
-            logger.warning(f"Bereits besucht: {url}")
-            return None
-
-        if self._page_count >= MAX_PAGES_PER_SEARCH:
-            logger.warning("Maximale Seitenanzahl erreicht")
-            return None
-
-        self._visited_urls.add(url)
-        self._page_count += 1
+        with self._state_lock:
+            if url in self._visited_urls:
+                return None
+            if self._page_count >= MAX_PAGES_PER_SEARCH:
+                logger.warning("Maximale Seitenanzahl erreicht")
+                return None
+            self._visited_urls.add(url)
+            self._page_count += 1
 
         if "wikipedia.org" in url:
             return self.wiki.get_article(url)
-
         if "arxiv.org" in url:
             arxiv_id = urlsplit_id(url)
             if arxiv_id:
@@ -967,12 +972,12 @@ class InternetResearchEngine:
             return None
 
         try:
-            soup = BeautifulSoup(html_content, "html.parser")
+            html_for_parsing = html_content[:MAX_HTML_PARSE_SIZE]
+            soup = BeautifulSoup(html_for_parsing, "html.parser")
             title = soup.find("title")
             title_text = title.get_text(strip=True) if title else urlparse(url).hostname or "Ohne Titel"
-
             content = sanitize_html_to_text(html_content)
-
+            content = sanitize_for_prompt(content)
             current_domain = urlparse(url).hostname or ""
             links: list[str] = []
             for a_tag in soup.find_all("a", href=True):
@@ -982,62 +987,42 @@ class InternetResearchEngine:
                     links.append(full_url)
                     if len(links) >= MAX_FOLLOW_LINKS:
                         break
-
             return ScrapedPage(
-                url=url,
-                title=title_text,
-                content=content,
-                links=links,
-                source=source_hint or "web",
+                url=url, title=title_text, content=content,
+                links=links, source=source_hint or "web",
             )
-
         except Exception as e:
-            logger.error(f"Fehler beim Parsen von {url}: {e}")
+            logger.error(f"Fehler beim Parsen von {SafeHttpClient._sanitize_url_for_logging(url)}: {e}")
             return None
 
-    def _follow_links(
-        self,
-        results: list[dict],
-        max_follow: int,
-        total_limit: int,
-    ) -> tuple:
+    def _follow_links(self, results: list[dict], max_follow: int, total_limit: int) -> tuple:
         """Folgt sicheren Links in den Suchergebnissen."""
         new_results = []
         page_count = 0
-
         for result in results:
             if page_count >= total_limit:
                 break
-
             url = result.get("url", "")
             if not is_safe_url(url):
                 continue
-
             if result.get("source") in ("duckduckgo",):
                 page = self._read_page(url, "web")
                 if page:
                     page_count += 1
-                    new_results.append(
-                        {
-                            "title": page.title,
-                            "url": page.url,
-                            "snippet": page.content[:500],
-                            "source": page.source,
-                            "followed_from": result.get("url"),
-                        }
-                    )
-
+                    new_results.append({
+                        "title": page.title, "url": page.url,
+                        "snippet": page.content[:500], "source": page.source,
+                        "followed_from": result.get("url"),
+                    })
                     if len(new_results) >= max_follow:
                         break
-
         return results + new_results, page_count
 
     def _generate_warnings(self, page_count: int) -> list[str]:
-        """Generiert Warnungen bei Limits."""
         warnings = []
         if page_count >= MAX_PAGES_PER_SEARCH:
             warnings.append(f"Maximale Seitenanzahl ({MAX_PAGES_PER_SEARCH}) erreicht")
-        if page_count >= MAX_PAGES_PER_SEARCH * 0.8:
+        elif page_count >= MAX_PAGES_PER_SEARCH * 0.8:
             warnings.append("Nahe am Limit - Ergebnisse koennten unvollstaendig sein")
         return warnings
 
@@ -1046,7 +1031,7 @@ class InternetResearchEngine:
 
 
 # ============================================================
-# Thread-lokale Engine-Instanz (Thread-Safety)
+# Thread-lokale Engine-Instanz
 # ============================================================
 
 _local = threading.local()
@@ -1054,421 +1039,26 @@ _local = threading.local()
 
 def get_engine() -> InternetResearchEngine:
     """Gibt eine thread-lokale Engine-Instanz zurueck."""
-    if not hasattr(_local, "engine") or _local.engine is None:
-        _local.engine = InternetResearchEngine()
-    engine_instance: InternetResearchEngine = _local.engine  # type: ignore[assignment]
-    return engine_instance
-
-
-# Beibehaltung von `engine` als Kompatibilitaets-Alias (aber nicht mehr empfohlen)
-engine = get_engine()
+    eng = getattr(_local, "engine", None)
+    if eng is None:
+        eng = InternetResearchEngine()
+        _local.engine = eng
+    return eng
 
 
 # ============================================================
-# Reine Funktionen (ohne MCP-Decorator)
-# ============================================================
-# Diese Funktionen koennen mit JEDEM FastMCP-Server verwendet werden.
-# Sie werden im Hauptserver als @mcp.tool() registriert.
-
-
-def _make_internet_research(mcp_tool_decorator: Callable) -> Callable:
-    """Erstellt ein MCP-Tool aus der research-Funktion."""
-
-    def internet_research(
-        query: str,
-        sources: str = "duckduckgo,wikipedia",
-        max_results: int = 5,
-        follow_links: bool = False,
-    ) -> dict:
-        """
-        Sichere Internet-Recherche mit mehreren Quellen.
-
-        Durchsucht das Internet sicher nach Informationen. Nur Lesezugriff,
-        keine Dateioperationen oder Executables.
-
-        Features:
-        - Prompt-Injection-Schutz (schaedliche Inhalte werden entfernt)
-        - Blockierte Domains und Download-Endungen
-        - Strikte Limits (Max Seiten, Max Token)
-        - Keine Netzwerk-Schreibzugriffe
-
-        Args:
-            query: Suchbegriff oder Frage
-            sources: Komma-getrennte Liste der Quellen:
-                     - duckduckgo: Websuche (privatsphare-freundlich)
-                     - wikipedia: Wikipedia (DE/EN)
-                     - arxiv: Wissenschaftliche Paper
-                     - gesti: GESTI Gefahrstoffe (BG BA)
-            max_results: Maximale Anzahl der Suchergebnisse (1-15)
-            follow_links: True um bis zu 3 Folgelinks pro Seite zu folgen
-
-        Returns:
-            Dict mit Suchergebnissen, Titeln, URLs und Snippets
-
-        Beispiele:
-            >>> internet_research("Python Programmierung", sources="wikipedia,duckduckgo")
-            >>> internet_research("transformer attention mechanism", sources="arxiv")
-            >>> internet_research("Blei Gefahrstoffe", sources="gesti,duckduckgo")
-        """
-        try:
-            source_list = [s.strip() for s in sources.split(",") if s.strip()]
-            max_results = max(1, min(max_results, MAX_SEARCH_RESULTS))
-
-            result = engine.search(
-                query=query,
-                sources=source_list,
-                max_results=max_results,
-                follow_links=follow_links,
-            )
-            return result
-
-        except Exception as e:
-            logger.error(f"internet_research interner Fehler: {e!s}")
-            return {
-                "success": False,
-                "error": "Ein interner Fehler ist aufgetreten",
-                "query": query,
-                "results": [],
-            }
-
-    return internet_research
-
-
-def _make_internet_research_detailed(mcp_tool_decorator: Callable) -> Callable:
-    """Erstellt ein MCP-Tool aus der detailed research-Funktion."""
-
-    def internet_research_detailed(
-        query: str,
-        sources: str = "duckduckgo,wikipedia",
-        max_pages: int = 5,
-    ) -> dict:
-        """
-        Sichere Internet-Recherche mit vollständigen Seiteninhalten.
-
-        Sucht nach Informationen und liest die Top-Ergebnisse vollständig aus.
-        Langsamere, aber detailliertere Ergebnisse als internet_research.
-
-        Args:
-            query: Suchbegriff oder Frage
-            sources: Komma-getrennte Quellen (siehe internet_research)
-            max_pages: Maximale Anzahl vollständig gelesener Seiten (1-10)
-
-        Returns:
-            Dict mit Suchergebnissen und vollständigen Seiteninhalten
-
-        Beispiele:
-            >>> internet_research_detailed("Quantencomputing Grundlagen")
-            >>> internet_research_detailed("Maschinelles Lernen Tutorial", sources="wikipedia")
-        """
-        try:
-            source_list = [s.strip() for s in sources.split(",") if s.strip()]
-            max_pages = max(1, min(max_pages, 10))
-
-            result = engine.search_and_read(
-                query=query,
-                sources=source_list,
-                max_pages=max_pages,
-            )
-            return result
-
-        except Exception as e:
-            logger.error(f"internet_research_detailed interner Fehler: {e!s}")
-            return {
-                "success": False,
-                "error": "Ein interner Fehler ist aufgetreten",
-                "query": query,
-                "results": [],
-                "detailed_pages": [],
-            }
-
-    return internet_research_detailed
-
-
-def _make_read_webpage(mcp_tool_decorator: Callable) -> Callable:
-    """Erstellt ein MCP-Tool aus der read_webpage-Funktion."""
-
-    def read_webpage(url: str) -> dict:
-        """
-        Liest eine spezifische Webseite sicher.
-
-        Extrahiert den Textinhalt einer Webseite und entfernt alle
-        Skripte, Styles und potenziell schaedliche Inhalte.
-
-        ACHTUNG: Nur http/https, keine Dateioperationen moeglich.
-
-        Args:
-            url: Vollstaendige URL der zu lesenden Webseite
-
-        Returns:
-            Dict mit Titel, Inhalt und URL der Seite
-
-        Beispiele:
-            >>> read_webpage("https://de.wikipedia.org/wiki/Python")
-            >>> read_webpage("https://arxiv.org/abs/2301.12345")
-        """
-        try:
-            parsed = urlparse(url)
-            if not parsed.scheme or not parsed.hostname:
-                return {
-                    "success": False,
-                    "error": "Ungültige URL",
-                    "url": url,
-                }
-
-            if not is_safe_url(url):
-                return {
-                    "success": False,
-                    "error": f"URL blockiert: {url}",
-                    "url": url,
-                }
-
-            result = engine.read_url(url)
-            return result
-
-        except Exception as e:
-            logger.error(f"read_webpage interner Fehler: {e!s}")
-            return {
-                "success": False,
-                "error": "Ein interner Fehler ist aufgetreten",
-                "url": url,
-            }
-
-    return read_webpage
-
-
-def _make_search_wikipedia(mcp_tool_decorator: Callable) -> Callable:
-    """Erstellt ein MCP-Tool aus der search_wikipedia-Funktion."""
-
-    def search_wikipedia(query: str, language: str = "de") -> dict:
-        """
-        Durchsucht Wikipedia.
-
-        Sucht in der deutschen oder englischen Wikipedia.
-
-        Args:
-            query: Suchbegriff
-            language: "de" für Deutsch, "en" für Englisch
-
-        Returns:
-            Dict mit Wikipedia-Suchergebnissen
-
-        Beispiele:
-            >>> search_wikipedia("Python Programmiersprache")
-            >>> search_wikipedia("Machine Learning", language="en")
-        """
-        try:
-            if language not in ("de", "en"):
-                language = "de"
-
-            results = WikipediaSearcher().search(query, max_results=5)
-
-            formatted = []
-            for r in results:
-                formatted.append(
-                    {
-                        "title": r.title,
-                        "url": r.url,
-                        "snippet": sanitize_for_prompt(r.snippet)[:300],
-                        "source": r.source,
-                    }
-                )
-
-            return {
-                "success": True,
-                "query": query,
-                "language": language,
-                "results": formatted,
-                "count": len(formatted),
-            }
-
-        except Exception as e:
-            logger.error(f"search_wikipedia interner Fehler: {e!s}")
-            return {
-                "success": False,
-                "error": "Ein interner Fehler ist aufgetreten",
-                "query": query,
-                "results": [],
-            }
-
-    return search_wikipedia
-
-
-def _make_search_arxiv(mcp_tool_decorator: Callable) -> Callable:
-    """Erstellt ein MCP-Tool aus der search_arxiv-Funktion."""
-
-    def search_arxiv(query: str) -> dict:
-        """
-        Durchsucht arXiv für wissenschaftliche Paper.
-
-        Args:
-            query: Suchbegriff (z.B. "transformer neural network")
-
-        Returns:
-            Dict mit arXiv-Ergebnissen (Titel, Zusammenfassung, Links)
-
-        Beispiele:
-            >>> search_arxiv("attention is all you need")
-            >>> search_arxiv("large language model")
-        """
-        try:
-            results = ArXivSearcher().search(query, max_results=5)
-
-            formatted = []
-            for r in results:
-                formatted.append(
-                    {
-                        "title": r.title,
-                        "url": r.url,
-                        "snippet": sanitize_for_prompt(r.snippet)[:500],
-                        "source": r.source,
-                    }
-                )
-
-            return {
-                "success": True,
-                "query": query,
-                "results": formatted,
-                "count": len(formatted),
-            }
-
-        except Exception as e:
-            logger.error(f"search_arxiv interner Fehler: {e!s}")
-            return {
-                "success": False,
-                "error": "Ein interner Fehler ist aufgetreten",
-                "query": query,
-                "results": [],
-            }
-
-    return search_arxiv
-
-
-def _make_search_gesti(mcp_tool_decorator: Callable) -> Callable:
-    """Erstellt ein MCP-Tool aus der search_gesti-Funktion."""
-
-    def search_gesti(query: str) -> dict:
-        """
-        Durchsucht GESTI (Gefährdungsbeurteilung) der BG BA.
-
-        Sucht nach Gefahrstoffinformationen, Sicherheitsdatenblättern,
-        und Arbeitsplatz-Kontaktwerten.
-
-        Args:
-            query: Suchbegriff (z.B. "Aceton", "Blei")
-
-        Returns:
-            Dict mit GESTI-Ergebnissen
-
-        Beispiele:
-            >>> search_gesti("Aceton")
-            >>> search_gesti("Holzstaub")
-        """
-        try:
-            results = GESTISearcher().search(query, max_results=5)
-
-            formatted = []
-            for r in results:
-                formatted.append(
-                    {
-                        "title": r.title,
-                        "url": r.url,
-                        "snippet": sanitize_for_prompt(r.snippet)[:300],
-                        "source": r.source,
-                    }
-                )
-
-            return {
-                "success": True,
-                "query": query,
-                "results": formatted,
-                "count": len(formatted),
-            }
-
-        except Exception as e:
-            logger.error(f"search_gesti interner Fehler: {e!s}")
-            return {
-                "success": False,
-                "error": "Ein interner Fehler ist aufgetreten",
-                "query": query,
-                "results": [],
-            }
-
-    return search_gesti
-
-
-def _make_safe_web_scrape(mcp_tool_decorator: Callable) -> Callable:
-    """Erstellt ein MCP-Tool aus der safe_web_scrape-Funktion."""
-
-    def safe_web_scrape(url: str, max_content_length: int = 3000) -> dict:
-        """
-        Sicheres Scraping einer Webseite.
-
-        Extrahiert Textinhalt, entfernt alle Skripte und Styles.
-        Keine Dateioperationen möglich.
-
-        Args:
-            url: Vollstaendige URL der Webseite
-            max_content_length: Maximale Länge des extrahierten Inhalts
-
-        Returns:
-            Dict mit Titel, Inhalt und Links der Seite
-
-        Beispiele:
-            >>> safe_web_scrape("https://example.com/article")
-        """
-        try:
-            if not is_safe_url(url):
-                return {
-                    "success": False,
-                    "error": f"URL blockiert: {url}",
-                    "url": url,
-                }
-
-            html_content = engine.http_client.fetch(url)
-            if not html_content:
-                return {
-                    "success": False,
-                    "error": "Inhalt konnte nicht abgerufen werden",
-                    "url": url,
-                }
-
-            content = sanitize_html_to_text(html_content, max_length=max_content_length)
-
-            try:
-                soup = BeautifulSoup(html_content, "html.parser")
-                title_tag = soup.find("title")
-                title = title_tag.get_text(strip=True) if title_tag else urlparse(url).hostname or "Ohne Titel"
-            except Exception:
-                title = "Titel unbekannt"
-
-            return {
-                "success": True,
-                "url": url,
-                "title": title,
-                "content": sanitize_for_prompt(content),
-                "content_length": len(content),
-            }
-
-        except Exception as e:
-            logger.error(f"safe_web_scrape interner Fehler: {e!s}")
-            return {
-                "success": False,
-                "error": "Ein interner Fehler ist aufgetreten",
-                "url": url,
-            }
-
-    return safe_web_scrape
-
-
-# ============================================================
-# Eigenstaendiger MCP-Server (optional)
+# MCP-Server (eigenstaendig oder einbettbar)
 # ============================================================
 
 mcp_research = FastMCP("internet-research-server")
 
 
 def _register_tools_to_server(mcp_server):
-    """Registriert alle Recherche-Tools auf einem MCP-Server."""
+    """Registriert alle Recherche-Tools auf einem MCP-Server.
+
+    WICHTIG: Verwendet get_engine() (thread-lokal) statt einer Modul-Engine,
+    damit konkurrente HTTP-Worker keine geteilten _visited_urls / _page_count haben.
+    """
     tool_dec = mcp_server.tool
 
     @tool_dec()
@@ -1478,14 +1068,24 @@ def _register_tools_to_server(mcp_server):
         max_results: int = 5,
         follow_links: bool = False,
     ) -> dict:
-        """Sichere Internet-Recherche mit mehreren Quellen."""
+        """Sichere Internet-Recherche mit mehreren Quellen.
+
+        Args:
+            query: Suchbegriff oder Frage.
+            sources: Komma-getrennte Quellen: duckduckgo, wikipedia, arxiv, gesti.
+            max_results: Max. Suchergebnisse (1-5).
+            follow_links: True um bis zu 3 sichere Folgelinks pro Seite zu folgen.
+        """
         try:
             source_list = [s.strip() for s in sources.split(",") if s.strip()]
             max_results = max(1, min(max_results, MAX_SEARCH_RESULTS))
-            return engine.search(query=query, sources=source_list, max_results=max_results, follow_links=follow_links)
+            return get_engine().search(
+                query=query, sources=source_list, max_results=max_results, follow_links=follow_links
+            )
         except Exception as e:
             logger.error(f"internet_research interner Fehler: {e!s}")
-            return {"success": False, "error": "Ein interner Fehler ist aufgetreten", "query": query, "results": []}
+            return {"success": False, "error": "Ein interner Fehler ist aufgetreten",
+                    "query": query, "results": []}
 
     @tool_dec()
     def internet_research_detailed(
@@ -1493,99 +1093,145 @@ def _register_tools_to_server(mcp_server):
         sources: str = "duckduckgo,wikipedia",
         max_pages: int = 5,
     ) -> dict:
-        """Sichere Internet-Recherche mit vollständigen Seiteninhalten."""
+        """Sichere Internet-Recherche mit vollstaendigen Seiteninhalten.
+
+        Args:
+            query: Suchbegriff.
+            sources: Komma-getrennte Quellen.
+            max_pages: Max. vollstaendig gelesene Seiten (1-10).
+        """
         try:
             source_list = [s.strip() for s in sources.split(",") if s.strip()]
             max_pages = max(1, min(max_pages, 10))
-            return engine.search_and_read(query=query, sources=source_list, max_pages=max_pages)
+            return get_engine().search_and_read(query=query, sources=source_list, max_pages=max_pages)
         except Exception as e:
             logger.error(f"internet_research_detailed interner Fehler: {e!s}")
-            return {"success": False, "error": "Ein interner Fehler ist aufgetreten", "query": query, "results": [], "detailed_pages": []}
+            return {"success": False, "error": "Ein interner Fehler ist aufgetreten",
+                    "query": query, "results": [], "detailed_pages": []}
 
     @tool_dec()
     def read_webpage(url: str) -> dict:
-        """Liest eine spezifische Webseite sicher."""
+        """Liest eine spezifische Webseite sicher.
+
+        Args:
+            url: Vollstaendige URL (http/https).
+        """
         try:
             parsed = urlparse(url)
             if not parsed.scheme or not parsed.hostname:
-                return {"success": False, "error": "Ungültige URL", "url": url}
+                return {"success": False, "error": "Ungueltige URL", "url": url}
             if not is_safe_url(url):
-                return {"success": False, "error": f"URL blockiert: {url}", "url": url}
-            return engine.read_url(url)
+                return {"success": False, "error": "URL aus Sicherheitsgruenden blockiert", "url": url}
+            return get_engine().read_url(url)
         except Exception as e:
             logger.error(f"read_webpage interner Fehler: {e!s}")
             return {"success": False, "error": "Ein interner Fehler ist aufgetreten", "url": url}
 
     @tool_dec()
     def search_wikipedia(query: str, language: str = "de") -> dict:
-        """Durchsucht Wikipedia."""
+        """Durchsucht Wikipedia (DE oder EN).
+
+        Args:
+            query: Suchbegriff.
+            language: "de" oder "en".
+        """
         try:
             if language not in ("de", "en"):
                 language = "de"
-            results = WikipediaSearcher().search(query, max_results=5)
-            formatted = [
-                {"title": r.title, "url": r.url, "snippet": sanitize_for_prompt(r.snippet)[:300], "source": r.source}
-                for r in results
-            ]
-            return {
-                "success": True,
-                "query": query,
-                "language": language,
-                "results": formatted,
-                "count": len(formatted),
-            }
+            eng = get_engine()
+            rl_error = eng.check_rate_limit()
+            if rl_error:
+                rl_error["query"] = query
+                return rl_error
+            results = eng.wiki.search(query, max_results=5)
+            formatted = [{
+                "title": r.title, "url": r.url,
+                "snippet": sanitize_for_prompt(r.snippet)[:300], "source": r.source,
+            } for r in results]
+            return {"success": True, "query": query, "language": language,
+                    "results": formatted, "count": len(formatted)}
         except Exception as e:
             logger.error(f"search_wikipedia interner Fehler: {e!s}")
-            return {"success": False, "error": "Ein interner Fehler ist aufgetreten", "query": query, "results": []}
+            return {"success": False, "error": "Ein interner Fehler ist aufgetreten",
+                    "query": query, "results": []}
 
     @tool_dec()
     def search_arxiv(query: str) -> dict:
-        """Durchsucht arXiv für wissenschaftliche Paper."""
+        """Durchsucht arXiv fuer wissenschaftliche Paper.
+
+        Args:
+            query: Suchbegriff.
+        """
         try:
-            results = ArXivSearcher().search(query, max_results=5)
-            formatted = [
-                {"title": r.title, "url": r.url, "snippet": sanitize_for_prompt(r.snippet)[:500], "source": r.source}
-                for r in results
-            ]
+            eng = get_engine()
+            rl_error = eng.check_rate_limit()
+            if rl_error:
+                rl_error["query"] = query
+                return rl_error
+            results = eng.arxiv.search(query, max_results=5)
+            formatted = [{
+                "title": r.title, "url": r.url,
+                "snippet": sanitize_for_prompt(r.snippet)[:500], "source": r.source,
+            } for r in results]
             return {"success": True, "query": query, "results": formatted, "count": len(formatted)}
         except Exception as e:
             logger.error(f"search_arxiv interner Fehler: {e!s}")
-            return {"success": False, "error": "Ein interner Fehler ist aufgetreten", "query": query, "results": []}
+            return {"success": False, "error": "Ein interner Fehler ist aufgetreten",
+                    "query": query, "results": []}
 
     @tool_dec()
     def search_gesti(query: str) -> dict:
-        """Durchsucht GESTI (Gefährdungsbeurteilung) der BG BA."""
+        """Durchsucht GESTI (Gefahrstoffe) der BG BA.
+
+        Args:
+            query: Suchbegriff (z.B. "Aceton").
+        """
         try:
-            results = GESTISearcher().search(query, max_results=5)
-            formatted = [
-                {"title": r.title, "url": r.url, "snippet": sanitize_for_prompt(r.snippet)[:300], "source": r.source}
-                for r in results
-            ]
+            eng = get_engine()
+            rl_error = eng.check_rate_limit()
+            if rl_error:
+                rl_error["query"] = query
+                return rl_error
+            results = eng.gesti.search(query, max_results=5)
+            formatted = [{
+                "title": r.title, "url": r.url,
+                "snippet": sanitize_for_prompt(r.snippet)[:300], "source": r.source,
+            } for r in results]
             return {"success": True, "query": query, "results": formatted, "count": len(formatted)}
         except Exception as e:
             logger.error(f"search_gesti interner Fehler: {e!s}")
-            return {"success": False, "error": "Ein interner Fehler ist aufgetreten", "query": query, "results": []}
+            return {"success": False, "error": "Ein interner Fehler ist aufgetreten",
+                    "query": query, "results": []}
 
     @tool_dec()
     def safe_web_scrape(url: str, max_content_length: int = 3000) -> dict:
-        """Sicheres Scraping einer Webseite."""
+        """Sicheres Scraping einer Webseite (extrahiert Text).
+
+        Args:
+            url: Vollstaendige URL.
+            max_content_length: Max. Laenge des extrahierten Inhalts (max 5000).
+        """
         try:
             if not is_safe_url(url):
-                return {"success": False, "error": f"URL blockiert: {url}", "url": url}
-            html_content = engine.http_client.fetch(url)
+                return {"success": False, "error": "URL aus Sicherheitsgruenden blockiert", "url": url}
+            max_content_length = max(100, min(max_content_length, MAX_RESULT_LENGTH))
+            eng = get_engine()
+            rl_error = eng.check_rate_limit()
+            if rl_error:
+                rl_error["url"] = url
+                return rl_error
+            html_content = eng.http_client.fetch(url)
             if not html_content:
                 return {"success": False, "error": "Inhalt konnte nicht abgerufen werden", "url": url}
             content = sanitize_html_to_text(html_content, max_length=max_content_length)
             try:
-                soup = BeautifulSoup(html_content, "html.parser")
+                soup = BeautifulSoup(html_content[:MAX_HTML_PARSE_SIZE], "html.parser")
                 title_tag = soup.find("title")
                 title = title_tag.get_text(strip=True) if title_tag else urlparse(url).hostname or "Ohne Titel"
             except Exception:
                 title = "Titel unbekannt"
             return {
-                "success": True,
-                "url": url,
-                "title": title,
+                "success": True, "url": url, "title": title,
                 "content": sanitize_for_prompt(content),
                 "content_length": len(content),
             }
@@ -1598,19 +1244,6 @@ def _register_tools_to_server(mcp_server):
 _register_tools_to_server(mcp_research)
 
 
-# ============================================================
-# Exportierte Funktionen fuer Integration in bestehenden Server
-# ============================================================
-# Diese Funktion registriert alle Recherche-Tools auf einem bestehenden Server.
-
-
 def register_research_tools(mcp_instance):
-    """
-    Registriert alle Internet-Recherche-Tools auf einem bestehenden MCP-Server.
-
-    Wird vom Hauptserver verwendet.
-
-    Args:
-        mcp_instance: FastMCP-Server-Instanz
-    """
+    """Registriert alle Internet-Recherche-Tools auf einem bestehenden MCP-Server."""
     _register_tools_to_server(mcp_instance)

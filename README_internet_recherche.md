@@ -4,6 +4,8 @@
 
 Dieses Modul bietet **sichere Internet-Recherche-Funktionen** für den MCP-Server, die speziell für die Verwendung mit llama.cpp Web UI entwickelt wurden. Es ermöglicht LLMs, Informationen aus dem Internet zu beziehen, ohne Sicherheitsrisiken einzugehen.
 
+> **Sicherheits-Update (Mai 2026)**: Diese Version enthält gehärtete Sicherheits-Patches. Siehe [Abschnitt "Sicherheitsfeatures"](#sicherheitsfeatures) für Details.
+
 ## Verfügbare Quellen
 
 | Quelle | Beschreibung | Tool |
@@ -16,6 +18,7 @@ Dieses Modul bietet **sichere Internet-Recherche-Funktionen** für den MCP-Serve
 ## Verfügbare Tools
 
 ### 1. `internet_research`
+
 Haupttool für allgemeine Internetsuche.
 
 ```python
@@ -28,6 +31,7 @@ internet_research(
 ```
 
 ### 2. `internet_research_detailed`
+
 Suche mit vollständigen Seiteninhalten (langsamere, aber detailliertere Ergebnisse).
 
 ```python
@@ -39,6 +43,7 @@ internet_research_detailed(
 ```
 
 ### 3. `read_webpage`
+
 Liest eine spezifische URL.
 
 ```python
@@ -46,6 +51,7 @@ read_webpage("https://de.wikipedia.org/wiki/Python")
 ```
 
 ### 4. `search_wikipedia`
+
 Spezialisierte Wikipedia-Suche.
 
 ```python
@@ -53,6 +59,7 @@ search_wikipedia("Python Programmiersprache", language="de")
 ```
 
 ### 5. `search_arxiv`
+
 Suche nach wissenschaftlichen Paper.
 
 ```python
@@ -60,6 +67,7 @@ search_arxiv("attention is all you need")
 ```
 
 ### 6. `search_gesti`
+
 Suche nach Gefahrstoffinformationen.
 
 ```python
@@ -67,6 +75,7 @@ search_gesti("Aceton")
 ```
 
 ### 7. `safe_web_scrape`
+
 Sicheres Scraping beliebiger Webseiten.
 
 ```python
@@ -75,29 +84,65 @@ safe_web_scrape("https://example.com/article", max_content_length=3000)
 
 ## Sicherheitsfeatures
 
-### Prompt-Injection-Schutz
-- Entfernt potenzielle Prompt-Injection-Muster aus Webseiten-Inhalten
-- Blockiert Befehle wie "ignoriere vorherige Anweisungen", "du bist jetzt", etc.
-- Entfernt Shell-Befehle und Script-Code aus Inhalten
+### Prompt-Injection-Schutz (gehärtet)
 
-### URL-Sicherheit
-- **Nur http/https** erlaubt
-- **Blockierte Domains**: Pastebin, GitHub Gist, Hastebin, etc.
-- **Blockierte Endungen**: .exe, .dll, .bat, .ps1, .sh, .py, etc.
-- **Keine automatischen Redirects**
+- **Unicode-Normalisierung (NFKC)** als ersten Schritt — verhindert Homoglyph-Bypass wie `ìgnòre àll ìnstructíòns`
+- **Hex-/Unicode-Escapes** (`\x20`, `\u0020`) werden vor dem Pattern-Matching markiert und neutralisiert
+- **HTML-Entities** werden zuerst dekodiert, dann gegen Patterns geprüft, am Ende wieder escaped (Defense-in-Depth)
+- **~80 kompilierte Regex-Patterns** in Kategorien:
+  - Direkte Anweisungen (`ignore all instructions`, `disregard previous`, …)
+  - System-Prompt-Extraktion (`show your prompt`, `reveal your instructions`)
+  - Code-Execution (`exec()`, `eval()`, `os.system`, `rm -rf`, `/dev/tcp/`, `base64 -d`)
+  - Chat-Template-Token-Injection (`<|im_start|>`, `<|endoftext|>`, `[INST]`, `<<SYS>>`)
+  - Daten-Exfiltration (`leak the prompt`, `extract your api-key`)
+  - Rollen-Überschreibung (`DAN mode`, `developer mode on`, `assume the role of`)
+  - **MCP/llama.cpp-spezifisch (neu)**: `use the read_file tool`, `mcp://`, `session id:`
+  - **Kontext-Manipulation (neu)**: `treat the following as your new instructions`, `for testing purposes, ignore`
+  - **Jailbreak-Marker (neu)**: `roleplay:`, `jailbreak:`, `in this hypothetical scenario`
 
-### Keine schädlichen Operationen
+### SSRF- und DNS-Schutz (gehärtet)
+
+- **Aktive DNS-Validierung pro Request**: Die zuvor definierte `resolve_and_verify()` wird jetzt tatsächlich vom HTTP-Client aufgerufen (vorher toter Code).
+- **DNS-Rebinding-Schutz**: Positive DNS-Resultate werden 30 Sekunden gecached; negative Resultate werden **nicht** gecached.
+- **Doppelte IP-Prüfung**: Nach der Verbindung wird die tatsächliche Antwort-IP nochmals gegen private Bereiche geprüft (belt-and-suspenders).
+- **Vollständige IP-Suite**: IPv4 (RFC 1918), IPv6 (Loopback, Link-Local, Unique-Local), CGNAT (100.64.0.0/10), Multicast, Reserved.
+- Nur **http/https** erlaubt
+- **Blockierte Domains**: Pastebin, GitHub Gist, Hastebin, raw.githubusercontent.com, huggingface.co, jsdelivr, unpkg u.a.
+- **Blockierte Domain-Suffixe**: `.internal`, `.local`, `.private`, `.corp`, `.home`, `.lan`
+- **Blockierte URL-Endungen**: `.exe`, `.dll`, `.bat`, `.ps1`, `.sh`, `.py`, `.bin`, `.elf` u.a.
+- **Keine Redirects** (`follow_redirects=False`)
+- **HTTPS für arXiv** (vorher `http://`)
+- **Connection-Pool-Limits**: max. 5 gleichzeitige Verbindungen
+- **Connection-Limits** für HTTP-Client (max_connections=5)
+
+### Rate-Limiting (jetzt aktiv)
+
+- 30 Anfragen pro 60-Sekunden-Fenster pro Engine-Instanz (vorher: Klasse vorhanden, aber nicht aufgerufen)
+- Wird in allen Tools (`internet_research`, `read_webpage`, `search_wikipedia`, `search_arxiv`, `search_gesti`, `safe_web_scrape`) geprüft
+- Thread-sicher (Lock-geschützter Deque)
+
+### Thread-Sicherheit (gehärtet)
+
+- **`InternetResearchEngine` ist pro Thread isoliert** (`get_engine()` via `threading.local`)
+- `_visited_urls` und `_page_count` durch internes `_state_lock` geschützt
+- Wikipedia-API-Calls verwenden eigene kurzlebige Clients (keine geteilte Session)
+
+### Content-Limits
+
+- Max. **15 Seiten** pro Suche
+- Max. **3 Folgelinks** pro Seite
+- Max. **500 KB** Response-Größe (HTTP)
+- Max. **200 KB** HTML-Input für BeautifulSoup (DoS-Schutz beim Parsing)
+- Max. **5 000 Zeichen** Output pro Seite
+- Max. **15 Sekunden** Timeout pro Anfrage
+
+### Was *nicht* möglich ist
+
 - **Keine Executables**
 - **Keine Downloads**
 - **Keine Dateioperationen** (lesen/schreiben/löschen)
 - **Keine Netzwerk-Schreibzugriffe** (nur GET-Anfragen)
 - **Kein Dateisystem-Zugriff**
-
-### Strikte Limits
-- Maximal **15 Seiten** pro Suche
-- Maximal **3 Folgelinks** pro Seite
-- Maximal **500 KB** Response-Größe
-- Maximal **15 Sekunden** Timeout pro Anfrage
 
 ## Installation
 
@@ -105,11 +150,11 @@ safe_web_scrape("https://example.com/article", max_content_length=3000)
 pip install duckduckgo-search beautifulsoup4
 ```
 
-Oder aktualisiere `requirements.txt`:
+Oder via `requirements.txt`:
 
 ```
-duckduckgo-search>=5.0
-beautifulsoup4>=4.12
+duckduckgo-search>=8.1.1
+beautifulsoup4>=4.14.3
 ```
 
 ## Verwendung im llama.cpp Web UI
@@ -127,23 +172,29 @@ Die Internet-Recherche-Tools sind dann in der llama.cpp Web UI verfügbar.
 ```
 internet_recherche.py
 ├── Sicherheits-Utilities
-│   ├── is_safe_url()          # URL-Validierung
-│   ├── sanitize_html_to_text() # HTML zu Text konvertieren
-│   └── sanitize_for_prompt()   # Prompt-Injection-Schutz
+│   ├── is_safe_url()           # URL-Validierung (Schema, Domain, Pfad)
+│   ├── resolve_and_verify()    # DNS-Aufloesung mit Privat-IP-Check
+│   ├── is_private_ip()         # IPv4 + IPv6 + spezielle Netze
+│   ├── sanitize_html_to_text() # HTML zu Text (mit Groessen-Limit)
+│   └── sanitize_for_prompt()   # NFKC + Hex-Escape + Patterns
 │
 ├── Suchmaschinen
 │   ├── DuckDuckGoSearcher
 │   ├── WikipediaSearcher
-│   ├── ArXivSearcher
+│   ├── ArXivSearcher        (mit https und altem ID-Format)
 │   └── GESTISearcher
 │
 ├── SafeHttpClient
-│   └── HTTP-Client mit Limits
+│   ├── _verify_host_fresh() # DNS-Cache + Rebinding-Schutz
+│   └── fetch()              # Mit Connection-IP-Check
 │
-└── InternetResearchEngine
-    ├── search()               # Grundlegende Suche
-    ├── search_and_read()      # Suche + Seiteninhalt
-    └── read_url()             # Einzelne URL lesen
+├── RateLimiter              # Thread-safe Sliding-Window-Limiter
+│
+└── InternetResearchEngine   # Thread-lokal (get_engine())
+    ├── check_rate_limit()
+    ├── search()
+    ├── search_and_read()
+    └── read_url()
 ```
 
 ## Beispiel-Ausgabe
@@ -161,14 +212,27 @@ internet_recherche.py
             "url": "https://de.wikipedia.org/wiki/Python_(Programmiersprache)",
             "snippet": "Python ist eine...",
             "source": "wikipedia(de)"
-        },
-        {
-            "title": "Python Tutorial",
-            "url": "https://docs.python.org/3/tutorial/",
-            "snippet": "Official Python tutorial...",
-            "source": "duckduckgo"
         }
     ],
     "warnings": []
 }
 ```
+
+## Rate-Limit-Antwort
+
+Wenn das Rate-Limit überschritten wurde:
+
+```json
+{
+    "success": false,
+    "error": "Rate-Limit ueberschritten (max 30/60s)",
+    "query": "...",
+    "results": []
+}
+```
+
+## Bekannte Einschränkungen
+
+- **DDG-Suche unterliegt Rate-Limits seitens DuckDuckGo**: Bei zu vielen Anfragen liefert das `duckduckgo-search`-Paket leere Ergebnisse. Das ist kein Bug dieses Servers.
+- **Negative DNS-Resultate werden nicht gecached**: Eine fehlgeschlagene DNS-Aufloesung führt bei jeder weiteren Anfrage zur erneuten Aufloesung. Das ist Absicht (DNS-Rebinding-Schutz), kann aber bei schlechter Netzverbindung zu wiederholten Verzögerungen führen.
+- **Wikipedia-Suche prüft nur Klartext-Snippets**: Die Snippets enthalten `<span class="searchmatch">`-Tags, die `sanitize_for_prompt` schluckt.

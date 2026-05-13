@@ -3,6 +3,9 @@
 Ein Model Context Protocol (MCP) Server, der dem LLM über llama.cpp
 Zugriff auf das lokale Dateisystem ermöglicht (Windows, Linux, macOS).
 
+> **Sicherheits-Update (Mai 2026)**: Diese Version enthält gehärtete
+> Sicherheits-Patches. Siehe [Abschnitt "Sicherheit"](#sicherheit) für Details.
+
 ## Installation
 
 1. Python 3.12+ installieren
@@ -27,25 +30,25 @@ Zugriff auf das lokale Dateisystem ermöglicht (Windows, Linux, macOS).
 
 | Tool                  | Beschreibung                                          | Parameter                                             |
 |-----------------------|-------------------------------------------------------|-------------------------------------------------------|
-| read_file             | Dateiinhalt lesen (Text oder Base64 bei Binärdateien) | `path`                                                |
-| read_file_binary      | Datei als Base64-codierte Binärdaten lesen            | `path`                                                |
-| write_file            | Datei schreiben / anhängen mit Codierung              | `path`, `content`, `append=False`, `encoding="utf-8"` |
-| write_file_binary     | Binärdaten (Base64) in Datei schreiben                | `path`, `content`, `encoding="base64"`                |
+| read_file             | Dateiinhalt lesen (max. 50 MB)                        | `path`                                                |
+| read_file_binary      | Datei als Base64-codierte Binärdaten lesen (max. 50 MB)| `path`                                               |
+| write_file            | Datei schreiben / anhängen (max. 50 MB)               | `path`, `content`, `append=False`, `encoding="utf-8"` |
+| write_file_binary     | Binärdaten (Base64) in Datei schreiben (max. 50 MB)   | `path`, `content`, `encoding="base64"`                |
 | rename_file           | Datei oder Verzeichnis umbenennen                     | `path`, `new_name`                                    |
 | touch_file            | Zeitstempel aktualisieren oder Datei erstellen        | `path`, `times=None`                                  |
 | get_file_lines        | Zeilenbereich lesen (Start/Ende Zeile)                | `path`, `start=0`, `end=None`                         |
 
 ### Verzeichnisoperationen
 
-| Tool               | Beschreibung                                      | Parameter                                    |
-|--------------------|---------------------------------------------------|----------------------------------------------|
-| list_directory     | Verzeichnis auflisten (mit hidden/recursiv)       | `path`, `recursive=False`, `hidden=False`    |
-| get_tree           | Verzeichnisbaum mit Einrückung und Emoji-Icons    | `path`, `max_depth=5`, `hidden=False`        |
-| create_directory   | Ordner erstellen (mit Eltern-Pfaden)              | `path`, `parents=True`                       |
-| delete_file        | Datei/Ordner löschen                              | `path`                                       |
-| count_entries      | Anzahl Dateien/Ordner in Verzeichnis zählen       | `path`, `recursive=False`                    |
-| empty_directory    | Verzeichnis leeren (Option: Struktur behalten)    | `path`, `keep_structure=True`                |
-| move_directory     | Komplettes Verzeichnis verschieben                | `source`, `destination`                      |
+| Tool               | Beschreibung                                      | Parameter                                                     |
+|--------------------|---------------------------------------------------|---------------------------------------------------------------|
+| list_directory     | Verzeichnis auflisten (mit hidden/recursiv)       | `path`, `recursive=False`, `hidden=False`, `max_entries=10000`|
+| get_tree           | Verzeichnisbaum (max. 5000 Einträge, Tiefe 1-10)  | `path`, `max_depth=5`, `hidden=False`                         |
+| create_directory   | Ordner erstellen (mit Eltern-Pfaden)              | `path`, `parents=True`                                        |
+| delete_file        | Datei/Ordner löschen (Symlinks werden NICHT gefolgt)| `path`                                                      |
+| count_entries      | Anzahl Dateien/Ordner zählen (max. 10000 rekursiv)| `path`, `recursive=False`                                     |
+| empty_directory    | Verzeichnis leeren (Option: Struktur behalten)    | `path`, `keep_structure=True`                                 |
+| move_directory     | Komplettes Verzeichnis verschieben                | `source`, `destination`                                       |
 
 ### Kopieren & Verschieben
 
@@ -56,35 +59,35 @@ Zugriff auf das lokale Dateisystem ermöglicht (Windows, Linux, macOS).
 | move_file           | Datei verschieben / umbenennen                 | `source`, `destination`                        |
 | create_hardlink     | Hardlink erstellen                             | `path`, `target`                               |
 
-### Archivoperationen
+### Archivoperationen (ZIP-Slip- und ZIP-Bomb-geschützt)
 
-| Tool                 | Beschreibung                           | Parameter                                         |
-|----------------------|----------------------------------------|---------------------------------------------------|
-| compress_archive     | Datei/Verzeichnis als ZIP komprimieren | `path`, `archive_path`, `compression="DEFLATED"`  |
-| decompress_archive   | ZIP-Archiv entpacken                   | `archive_path`, `destination`                     |
+| Tool                 | Beschreibung                                                                   | Parameter                                         |
+|----------------------|--------------------------------------------------------------------------------|---------------------------------------------------|
+| compress_archive     | Datei/Verzeichnis als ZIP komprimieren (max. 10000 Dateien)                    | `path`, `archive_path`, `compression="DEFLATED"`  |
+| decompress_archive   | ZIP-Archiv entpacken — mit Path-Traversal-, Symlink- und Bomb-Schutz           | `archive_path`, `destination`                     |
 
 ### Suche
 
-| Tool             | Beschreibung                                    | Parameter                                                        |
-|------------------|-------------------------------------------------|------------------------------------------------------------------|
-| search_files     | Dateien mit Glob-Muster suchen (case-sensitive) | `path`, `pattern="*"`, `max_results=100`, `case_sensitive=False` |
-| get_recent_files | Zuletzt geänderte Dateien finden                | `path`, `max_results=20`, `time_range_days=7`                    |
+| Tool             | Beschreibung                                            | Parameter                                                        |
+|------------------|---------------------------------------------------------|------------------------------------------------------------------|
+| search_files     | Dateien mit Glob-Muster suchen (max. 10000 gescannt)    | `path`, `pattern="*"`, `max_results=100`, `case_sensitive=False` |
+| get_recent_files | Zuletzt geänderte Dateien finden                        | `path`, `max_results=20`, `time_range_days=7`                    |
 
 ### Informationen
 
-| Tool                 | Beschreibung                                   | Parameter                     |
-|----------------------|------------------------------------------------|-------------------------------|
-| get_file_info        | Dateiinformationen (Größe, Datum, Typ, Symlink)| `path`                        |
-| get_disk_usage       | Festplattenauslastung anzeigen                 | `path="."`                    |
-| get_working_directory| Aktuelles Arbeitsverzeichnis und System-Info   | (keine)                       |
-| get_allowed_roots    | Konfigurierte Root-Pfade und blockierte Pfade  | (keine)                       |
-| get_file_hash        | Hash berechnen (MD5, SHA1, SHA256, SHA512)     | `path`, `algorithm="sha256"`  |
-| get_file_permissions | Dateiberechtigungen lesen (Unix-Modus)         | `path`                        |
-| chmod_file           | Dateiberechtigungen ändern (chmod)             | `path`, `mode`                |
-| list_drives          | Alle Laufwerke mit Kapazität anzeigen          | (keine)                       |
-| get_user_directories | Benutzer-Ordner (Desktop, Dokumente, etc.)     | (keine)                       |
-| get_temp_directory   | Temp-Verzeichnis mit Speicherplatz-Analyse     | (keine)                       |
-| path_exists          | Pfadexistenz und Typ prüfen                    | `path`                        |
+| Tool                 | Beschreibung                                          | Parameter                     |
+|----------------------|-------------------------------------------------------|-------------------------------|
+| get_file_info        | Dateiinformationen (inkl. symlink_target + realpath)  | `path`                        |
+| get_disk_usage       | Festplattenauslastung anzeigen                        | `path="."`                    |
+| get_working_directory| Aktuelles Arbeitsverzeichnis und System-Info          | (keine)                       |
+| get_allowed_roots    | Konfigurierte Root-Pfade und blockierte Pfade         | (keine)                       |
+| get_file_hash        | Hash berechnen (MD5, SHA1, SHA256, SHA512), max. 50 MB | `path`, `algorithm="sha256"`  |
+| get_file_permissions | Dateiberechtigungen lesen (Unix-Modus)                | `path`                        |
+| chmod_file           | Berechtigungen ändern — restriktiv (max. 0o755)       | `path`, `mode`                |
+| list_drives          | Alle Laufwerke mit Kapazität anzeigen                 | (keine)                       |
+| get_user_directories | Benutzer-Ordner (Desktop, Dokumente, etc.)            | (keine)                       |
+| get_temp_directory   | Temp-Verzeichnis mit Speicherplatz-Analyse            | (keine)                       |
+| path_exists          | Pfadexistenz und Typ prüfen                           | `path`                        |
 
 ### Symlinks
 
@@ -109,16 +112,49 @@ Zugriff auf das lokale Dateisystem ermöglicht (Windows, Linux, macOS).
 
 ## Sicherheit
 
-- Blockierte Systemverzeichnisse sind gesperrt
-- Pfade werden als absolut aufgelöst
-- Alle Pfadoperationen werden auf Berechtigung geprüft
-- Blockierte Pfade: System32\config, WindowsApps, /etc/shadow, /etc/sudoers
+Diese Version enthält die folgenden Härtungen gegenüber der Erstversion:
 
-## Konfiguration
+### Kritische Schutzmaßnahmen
+
+- **Symlink-Ziel-Validierung** (`is_path_safe`): Jeder Pfad-Zugriff prüft nicht nur den eingegebenen Pfad, sondern auch das Symlink-Ziel (`os.path.realpath`). Ein Symlink namens `~/legit.txt → /etc/shadow` wird zuverlässig abgelehnt.
+- **ZIP-Slip-Schutz** in `decompress_archive`: Pro Eintrag werden absolute Pfade, Drive-Letters, Path-Traversal (`../`) und Symlinks im Archiv abgelehnt. Zusätzlich wird der normalisierte Zielpfad gegen das (real aufgelöste) Zielverzeichnis validiert.
+- **ZIP-Bomb-Schutz**: `decompress_archive` weist Archive ab mit:
+  - Mehr als 10 000 Dateien
+  - Mehr als 500 MB entpacktes Gesamtvolumen
+  - Kompressionsverhältnis > 100× bei > 10 MB unkomprimierter Größe
+- **Null-Byte-Schutz** in allen Pfad-Eingaben (`\x00` blockiert).
+
+### Hohe Priorität
+
+- **Eintrags-Limits für rekursive Operationen**: `list_directory`, `get_tree`, `count_entries`, `search_files`, `get_recent_files` und `get_temp_directory` brechen nach maximalen Eintragsmengen ab (DoS-Schutz). Antworten enthalten `truncated: true`, wenn das Limit erreicht wurde.
+- **Größenlimits**: `read_file`, `read_file_binary`, `write_file`, `write_file_binary`, `get_file_hash` und `get_file_lines` lehnen Dateien über 50 MB ab.
+- **Restriktives `chmod_file`**: Akzeptiert nur Modi ≤ 0o755 und blockiert `setuid`, `setgid` und world-writable Bits (kein 0o777, 0o666, 0o4xxx, 0o2xxx).
+- **CORS konfigurierbar** statt `*`: Standard ist jetzt eine kommagetrennte Liste von localhost-Origins; per Umgebungsvariable `MCP_ALLOWED_ORIGINS` änderbar.
+- **`delete_file` folgt keinen Symlinks**: Symlinks selbst werden gelöscht, nicht das Ziel.
+- **Erweiterte blockierte Pfade**: `/etc/sudoers.d`, `/etc/ssh`, `/sys`, `/dev`, `/root/.ssh`, `C:\Windows\System32\drivers`, `C:\$Recycle.Bin`, `C:\System Volume Information` u.a.
+- **Bind-Warnung**: Server warnt beim Start, wenn auf `0.0.0.0` oder `::` gebunden wird.
+
+### Konfiguration
 
 Umgebungsvariablen:
 
-- `MCP_FILESYSTEM_ROOT` - Startverzeichnis (Default: Home-Verzeichnis)
+| Variable                | Beschreibung                           | Default             |
+|-------------------------|----------------------------------------|--------------------------------|
+| `MCP_FILESYSTEM_ROOT`   | Startverzeichnis                       | Home-Verzeichnis    |
+| `MCP_ALLOWED_ORIGINS`   | Kommagetrennte CORS-Origins. `*` erlaubt alle (NUR für reines Localhost!) | `http://127.0.0.1:8080,http://localhost:8080,http://127.0.0.1:8765,http://localhost:8765`|
+
+Beispiel für Produktion:
+
+```bash
+set MCP_ALLOWED_ORIGINS=http://127.0.0.1:8080
+python lokales_dateisystem.py --host 127.0.0.1 --port 8765
+```
+
+### Bekannte Einschränkungen / nicht behoben
+
+- **TOCTOU-Race**: Zwischen `is_path_safe` und der eigentlichen Datei-Operation könnte ein lokaler Angreifer theoretisch einen Symlink unterschieben. Auf Single-User-Systemen (typischer llama.cpp-Use-Case) ist das kein realistisches Risiko; Mitigation per File-Descriptor-basierter API (`openat`) wurde wegen Portabilitäts-Verlust nicht umgesetzt.
+- **Keine eingebaute Authentifizierung**: Der MCP-Server hat keine Auth-Schicht; das ist im aktuellen MCP-Protokoll auch nicht standardisiert. Schutz erfolgt ausschließlich über das Binding auf `127.0.0.1` (Default) und CORS.
+- **chmod_file mit max. 0o755**: Wer 0o775 (Gruppe schreiben) oder 0o770 benötigt, kommt mit dieser Restriktion nicht durch. Begründung: Risiko durch LLM-Fehlsteuerung höher als Nutzen.
 
 ## Transport-Modi
 
@@ -130,7 +166,7 @@ Umgebungsvariablen:
 
 ## Hinweis
 
-Der Server nutzt UTF-8-Codierung für Eingabe/Ausgabe. Bei Problemen mit Umlauten bitte sicherstellen, dass die Umgebung Variablen `PYTHONUTF8=1` und `PYTHONIOENCODING=utf-8` gesetzt sind.
+Der Server nutzt UTF-8-Codierung für Eingabe/Ausgabe. Bei Problemen mit Umlauten bitte sicherstellen, dass die Umgebungsvariablen `PYTHONUTF8=1` und `PYTHONIOENCODING=utf-8` gesetzt sind.
 
 ## Beispiel-URL
 
