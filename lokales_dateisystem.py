@@ -1909,7 +1909,7 @@ def main() -> None:
         # CORS jetzt konfigurierbar (Patch: nicht mehr hardcoded "*")
         # Default fuer lokalen llama.cpp-Use-Case ist localhost; in
         # Produktion sollte MCP_ALLOWED_ORIGINS gesetzt werden.
-        cors_default = "http://127.0.0.1:8080,http://localhost:8080,http://127.0.0.1:8765,http://localhost:8765"
+        cors_default = "http://127.0.0.1:8080,http://localhost:8080,http://127.0.0.1:8765,http://localhost:8765,http://127.0.0.1:1234,http://localhost:1234"
         origins_env = os.environ.get("MCP_ALLOWED_ORIGINS", cors_default)
         allowed_origins = _parse_allowed_origins(origins_env)
         logger.info(f"CORS allowed_origins: {allowed_origins}")
