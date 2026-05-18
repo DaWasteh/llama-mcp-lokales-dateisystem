@@ -1902,9 +1902,11 @@ def main() -> None:
         )
 
     if args.transport in ("streamable-http", "sse"):
+        import asyncio
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
-        from starlette.responses import JSONResponse
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse, StreamingResponse
         from starlette.routing import Route
 
         if args.transport == "streamable-http":
@@ -1930,6 +1932,52 @@ def main() -> None:
             allow_headers=["mcp-session-id", "mcp-protocol-version", "Content-Type", "Authorization"],
             expose_headers=["mcp-session-id", "mcp-protocol-version"],
         )
+
+        # GET-Route fuer StreamableHTTP-SSE-Push (von llama.cpp WebUI verwendet)
+        if args.transport == "streamable-http":
+            from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+            # Finde den Session-Manager in den App-Extensions
+            _app_state = getattr(app, "_state", {})
+            _session_manager = _app_state.get("session_manager")
+
+            async def sse_stream(request: Request):
+                async def event_stream():
+                    if _session_manager is None:
+                        yield 'data: {"error":"Session manager not available"}\n\n'
+                        return
+                    try:
+                        # Erstelle einen neuen Context fuer die SSE-Verbindung
+                        session_id = request.headers.get("mcp-session-id", "")
+                        if session_id:
+                            # Bestehende Session verwenden
+                            conn = _session_manager._sessions.get(session_id)
+                            if conn:
+                                async for event in conn.response_queue:
+                                    yield event
+                                    await asyncio.sleep(0.1)
+                            else:
+                                yield 'data: {"error":"Session not found"}\n\n'
+                                return
+                        else:
+                            yield 'data: {"error":"No session ID"}\n\n'
+                            return
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as e:
+                        yield f'data: {{"error":"{e}"}}\n\n'
+                        return
+
+                return StreamingResponse(
+                    event_stream(),
+                    media_type="text/event-stream",
+                    headers={
+                        "cache-control": "no-cache",
+                        "connection": "keep-alive",
+                    },
+                )
+
+            app.routes.append(Route(endpoint, sse_stream, methods=["GET"]))
 
         async def root(_request):
             return JSONResponse({
