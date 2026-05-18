@@ -1903,6 +1903,7 @@ def main() -> None:
 
     if args.transport in ("streamable-http", "sse"):
         import asyncio
+
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
         from starlette.requests import Request
@@ -1935,7 +1936,6 @@ def main() -> None:
 
         # GET-Route fuer StreamableHTTP-SSE-Push (von llama.cpp WebUI verwendet)
         if args.transport == "streamable-http":
-            from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
             # Finde den Session-Manager in den App-Extensions
             _app_state = getattr(app, "_state", {})

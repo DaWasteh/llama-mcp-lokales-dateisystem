@@ -7,13 +7,9 @@ import base64
 import os
 import sys
 import time
-import zipfile
-
-import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import lokales_dateisystem as fs
-
 
 # ---------------------------------------------------------------------------
 # read_file / write_file

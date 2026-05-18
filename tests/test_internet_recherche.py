@@ -18,7 +18,6 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import internet_recherche as ir
 
-
 # ---------------------------------------------------------------------------
 # is_private_ip – IPv4, IPv6, Spezialnetze
 # ---------------------------------------------------------------------------
