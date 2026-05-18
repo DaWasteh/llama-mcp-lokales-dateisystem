@@ -1,0 +1,13 @@
+{
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "standard",
+  "reportMissingImports": false,
+  "reportMissingModuleSource": false,
+  "reportUnusedImport": true,
+  "reportDuplicateImport": true,
+  "reportUndefinedVariable": true,
+  "reportOperatorIssue": true,
+  "reportReturnType": true,
+  "reportIndexIssue": true,
+  "reportAttributeAccessIssue": true
+}
