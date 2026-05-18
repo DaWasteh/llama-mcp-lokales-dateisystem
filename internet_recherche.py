@@ -590,7 +590,8 @@ class WikipediaSearcher:
                     "srprop": "snippet|title|wordcount",
                     "srinfo": "suggestion",
                 }
-                with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
+                headers = {"User-Agent": "llama-mcp-research/1.0 (Internet-Recherche; +https://github.com/Sebas/llama-mcp)"}
+                with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False, headers=headers) as client:
                     response = client.get(api_url, params=params)  # type: ignore[arg-type]
                     data = response.json()
                     search_terms = data.get("query", {}).get("search", [])
@@ -639,7 +640,8 @@ class WikipediaSearcher:
                 "explaintext": True,
                 "format": "json",
             }
-            with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
+            headers = {"User-Agent": "llama-mcp-research/1.0 (Internet-Recherche; +https://github.com/Sebas/llama-mcp)"}
+            with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False, headers=headers) as client:
                 response = client.get(api_url, params=params)  # type: ignore[arg-type]
                 data = response.json()
                 pages = data.get("query", {}).get("pages", {})
