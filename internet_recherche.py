@@ -309,20 +309,20 @@ class RateLimiter:
 _INJECTION_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
     # Direkte Anweisungen
     r"ignore\s+all\s+(previous\s+)?instructions?",
-    r"disregard\s+(previous|all|the\s+above|earlier)",
-    r"you\s+are\s+now\s+",
+    r"disregard\s+(previous|all|the\s+above|earlier)\s+instructions?",
+    r"you\s+are\s+now\s+(?:a\s+|an\s+)?(?:AI|assistant|bot|chatbot|different|evil|free|jailbreak|unrestricted|unfiltered|DAN|GPT|model\b)",
     r"from\s+now\s+on,?\s+(you|act|behave)",
     r"change\s+your\s+(behavior|rules|instructions|prompt|persona)",
-    r"reset\s+(your\s+)?(instructions|prompt|system|context)",
+    r"reset\s+(your\s+)?(instructions|prompt|system\s+prompt|conversation\s+context)",
     r"override\s+(your\s+)?(instructions|safety|guidelines|rules)",
     r"forget\s+(your\s+)?(previous|all|earlier)\s+instructions?",
-    # System-Prompt Extraktion
-    r"system\s*[:\-]\s*",
-    r"show\s+(me\s+)?your\s+(system\s+)?prompt",
+    # System-Prompt Extraktion  (enger gefasst, um "Betriebssystem:", "file system:" etc. nicht zu treffen)
+    r"(?:^|\n)\s*system\s*[:\-]\s*",
+    r"show\s+(me\s+)?your\s+system\s+prompt",
     r"reveal\s+(your\s+)?(instructions|system\s+prompt|hidden\s+prompt)",
-    r"previous\s+prompt",
+    r"previous\s+(?:system\s+)?prompt",
     r"above\s+instructions",
-    r"display\s+(your\s+)?system",
+    r"display\s+(?:your\s+)?system\s+(?:prompt|instructions?)",
     r"print\s+(your\s+)?(system\s+)?prompt",
     r"repeat\s+(your\s+)?(initial|original|system)\s+(prompt|instructions)",
     # Code Execution
@@ -373,8 +373,8 @@ _INJECTION_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
     r"steal\s+(your|the)\s+",
     r"extract\s+(your|the)\s+(system|api[\- ]?key|secret|password)",
     r"\bleak\s+(the|your)\s+(prompt|key|secret)",
-    # Rollen-Ueberschreibung
-    r"you\s+are\s+now\s+a",
+    # Rollen-Ueberschreibung (BUGFIX: \b verhindert Match auf "now able", "now available" etc.)
+    r"you\s+are\s+now\s+a\b(?!\w)",
     r"assume\s+the\s+role\s+of",
     r"act\s+as\s+if\s+you\s+(were|are)",
     r"adopt\s+the\s+persona\s+of",
@@ -394,7 +394,7 @@ _INJECTION_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
     # Jailbreak / Roleplay (NEU)
     r"\broleplay\s*[:\-]\s*you\s+(are|will)",
     r"\bjailbreak\s*[:\-]",
-    r"in\s+this\s+(hypothetical|fictional|imaginary|alternate)\s+(scenario|world|story|universe)",
+    r"in\s+this\s+(hypothetical|fictional|imaginary|alternate)\s+(scenario|world|story|universe)[^.]*(?:ignore|bypass|override|disregard)",
 ]]
 
 _UNICODE_ESCAPE_RE = re.compile(r"\\u[0-9a-fA-F]{4}")
@@ -527,7 +527,7 @@ class SafeHttpClient:
                 logger.warning(f"Nicht-Text Content-Type: {content_type}")
                 return None
 
-            return response.text
+            return str(response.text)
         except httpx.TimeoutException:
             logger.warning(f"Timeout bei {self._sanitize_url_for_logging(url)}")
             return None
@@ -620,9 +620,15 @@ class WikipediaSearcher:
     def get_article(self, url: str) -> ScrapedPage | None:
         try:
             parsed = urlparse(url)
-            parts = parsed.path.strip("/").split("/", 1)
-            lang = parts[0] if parts else "en"
-            title = parts[1] if len(parts) > 1 else ""
+            # Lang aus Hostnamen extrahieren (de.wikipedia.org -> "de")
+            # BUGFIX: vorher wurde lang aus dem Pfad gelesen → ergab immer "wiki"
+            hostname = parsed.hostname or "en.wikipedia.org"
+            lang = hostname.split(".")[0] if hostname.endswith("wikipedia.org") else "en"
+            if lang not in ("de", "en", "fr", "es", "it", "pt", "nl", "pl", "ru", "ja", "zh"):
+                lang = "en"
+            # Titel aus Pfad extrahieren: /wiki/Artikelname -> "Artikelname"
+            path_parts = parsed.path.strip("/").split("/", 1)
+            title = path_parts[1] if len(path_parts) > 1 else path_parts[0] if path_parts else ""
 
             api_url = self.WIKI_API_URL.format(lang=lang)
             params: Mapping[str, str | int | float | bool | None] = {

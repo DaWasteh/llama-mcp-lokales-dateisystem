@@ -10,7 +10,6 @@ jobs:
   lint-and-type-check:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
         python-version: ["3.12"]
 
@@ -26,24 +25,24 @@ jobs:
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-        pip install ruff mypy httpx
+        pip install -r requirements.txt
+        pip install ruff mypy
 
     - name: Lint with Ruff
       run: |
         ruff check internet_recherche.py lokales_dateisystem.py
 
-    - name: Format check with Ruff
+    - name: Import-Order check with Ruff
       run: |
         ruff check --select I --diff internet_recherche.py lokales_dateisystem.py
 
     - name: Run MyPy on lokales_dateisystem.py
       run: |
-        mypy lokales_dateisystem.py --ignore-missing-imports --check-untyped-defs --no-error-summary
+        python -m mypy lokales_dateisystem.py --no-error-summary
 
     - name: Run MyPy on internet_recherche.py
       run: |
-        mypy internet_recherche.py --ignore-missing-imports --check-untyped-defs --no-error-summary
+        python -m mypy internet_recherche.py --no-error-summary
 
     - name: Syntax-Prüfung (import test)
       run: |
@@ -52,4 +51,4 @@ jobs:
 
     - name: Test with pytest
       run: |
-        python -m pytest --tb=short -q || true
+        python -m pytest --tb=short -q
