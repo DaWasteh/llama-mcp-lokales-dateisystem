@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ "main", "master" ]
 
+# Node.js 24 opt-in (wird ab 2. Juni 2026 erzwungen, hier vorsorglich gesetzt)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 # ──────────────────────────────────────────────────────────────
 # Job 1: Lint + Type-Check (einmalig, schnell, OS-unabhaengig)
 # ──────────────────────────────────────────────────────────────

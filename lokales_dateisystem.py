@@ -148,12 +148,20 @@ def is_path_safe(path: str, must_exist: bool = False) -> tuple[bool, str]:
 
     Prueft:
       1. Null-Byte im Pfad
-      2. Blockierte Direkt-Pfade (is_path_blocked)
-      3. Realpath (Symlink-Ziel) ist nicht blockiert
-      4. Alle Eltern-Komponenten sind keine Symlinks zu blockierten Zielen
+      2. Blockierte Direkt-Pfade am Original-Pfad (plattformsicher: fängt
+         Unix-Pfade wie /etc/shadow auf Windows ab, bevor abspath() sie umbiegt)
+      3. Blockierte Pfade nach Aufloesung zu abs_path
+      4. Realpath (Symlink-Ziel) ist nicht blockiert
+      5. Alle Eltern-Komponenten sind keine Symlinks zu blockierten Zielen
     """
     if _has_null_byte(path):
         return False, "Null-Byte im Pfad"
+
+    # Originalpath pruefen BEVOR os.path.abspath() ihn plattformspezifisch umbaut.
+    # Auf Windows wuerde abspath('/etc/shadow') zu 'C:\etc\shadow' werden und
+    # den nachfolgenden is_path_blocked()-Check umgehen.
+    if is_path_blocked(path):
+        return False, f"Pfad blockiert: {path}"
 
     try:
         abs_path = os.path.abspath(path)
